@@ -17,9 +17,5 @@
       "tag": "v1",
       "new_sqlite_classes": ["RelayHub"]
     }
-  ],
-  "vars": {
-    "UPSTREAM_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net",
-    "ADMIN_USER": "admin"
-  }
+  ]
 }

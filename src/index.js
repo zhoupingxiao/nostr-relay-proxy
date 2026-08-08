@@ -1,8 +1,28 @@
-function relaysFromEnv(env) {
-  return (env.UPSTREAM_RELAYS || "")
+function configuredRelays(env) {
+  // This binding is configured in the Cloudflare dashboard. It seeds only a
+  // brand-new Durable Object; subsequent changes belong in the admin UI.
+  return (typeof env.UPSTREAM_RELAYS === "string" ? env.UPSTREAM_RELAYS : "")
     .split(",")
     .map(s => s.trim())
-    .filter(Boolean);
+    .filter(isRelayUrl)
+    .map(url => ({
+      url,
+      enabled: true,
+      connected: false,
+      reconnects: 0,
+      lastError: null,
+      lastConnectedAt: null
+    }));
+}
+
+function isRelayUrl(value) {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "ws:" || url.protocol === "wss:") &&
+      !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 function json(data, status = 200) {
@@ -13,14 +33,18 @@ function json(data, status = 200) {
 }
 
 function authOk(request, env) {
+  const username = typeof env.ADMIN_USER === "string" ? env.ADMIN_USER : "";
+  const password = typeof env.ADMIN_PASSWORD === "string" ? env.ADMIN_PASSWORD : "";
+  // A deployment must not inherit a usable default administrator account.
+  if (!username || !password) return false;
+
   const h = request.headers.get("authorization") || "";
   if (!h.startsWith("Basic ")) return false;
   try {
     const decoded = atob(h.slice(6));
     const i = decoded.indexOf(":");
     if (i < 0) return false;
-    return decoded.slice(0, i) === (env.ADMIN_USER || "admin") &&
-           decoded.slice(i + 1) === (env.ADMIN_PASSWORD || "");
+    return decoded.slice(0, i) === username && decoded.slice(i + 1) === password;
   } catch { return false; }
 }
 
@@ -135,9 +159,7 @@ export class RelayHub {
 
   async load() {
     if (this.loaded) return;
-    this.relays = await this.state.storage.get("relays") || relaysFromEnv(this.env).map(url => ({
-      url, enabled: true, connected: false, reconnects: 0, lastError: null, lastConnectedAt: null
-    }));
+    this.relays = await this.state.storage.get("relays") || configuredRelays(this.env);
     this.stats = await this.state.storage.get("stats") || this.stats;
     this.loaded = true;
     for (const r of this.relays.filter(x => x.enabled)) this.connectUpstream(r.url);
@@ -165,7 +187,7 @@ export class RelayHub {
     if (url.pathname === "/relays" && request.method === "POST") {
       const body = await request.json();
       const relay = String(body.url || "").trim();
-      if (!/^wss?:\/\//i.test(relay)) return json({ error: "invalid relay url" }, 400);
+      if (!isRelayUrl(relay)) return json({ error: "invalid relay url" }, 400);
       if (!this.relays.some(r => r.url === relay)) {
         const item = { url: relay, enabled: true, connected: false, reconnects: 0, lastError: null, lastConnectedAt: null };
         this.relays.push(item);
