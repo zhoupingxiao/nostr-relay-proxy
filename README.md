@@ -14,7 +14,7 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 - 公开状态首页：在线状态、用户/订阅数、Relay 连接状态与连接时长
 - 独立的后台登录页与 8 小时安全会话
 - 上游 Relay 增删、启停
-- 在线客户端/订阅/事件统计
+- 在线客户端、客户端活跃订阅、上游活跃订阅、事件与流量统计
 - Cloudflare Workers GitHub CI/CD
 - 不使用 D1/R2
 
@@ -66,6 +66,11 @@ npx wrangler dev
 ## 上游 Relay 配置
 
 `UPSTREAM_RELAYS` 仅用于初始化一个全新的 Durable Object。初始化完成后，上游列表保存在 Durable Object Storage 中，请在 `/admin` 增删或启停。之后即使修改 Dashboard 中的 `UPSTREAM_RELAYS`，也不会覆盖已有列表。
+
+## 订阅统计口径
+
+- `客户端活跃订阅`：当前客户端连接发起并仍未关闭的 `REQ` 数量。
+- `上游活跃订阅`：代理实际转发到上游 Relay、并仍在路由表中的订阅数量。一个客户端订阅会按已连接的上游 Relay 展开，所以通常会大于或等于客户端活跃订阅。
 
 ## GitHub Actions
 
