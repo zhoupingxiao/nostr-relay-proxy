@@ -3,6 +3,7 @@
   "name": "nostr-relay-proxy",
   "main": "src/index.js",
   "compatibility_date": "2026-08-08",
+  "keep_vars": true,
   "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
