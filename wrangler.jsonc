@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nostr-relay-proxy-admin",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-08",
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RELAY",
+        "class_name": "RelayHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RelayHub"]
+    }
+  ],
+  "vars": {
+    "UPSTREAM_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net",
+    "ADMIN_USER": "admin"
+  }
+}
