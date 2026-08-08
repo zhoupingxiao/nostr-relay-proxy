@@ -5,8 +5,7 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 ## 功能
 
 - WebSocket Nostr Relay：EVENT / REQ / CLOSE / COUNT / NEG-OPEN / NEG-MSG / NEG-CLOSE
-- 多上游 Relay 聚合
-- Event 去重
+- 多上游 Relay 聚合：发布和订阅均覆盖全部在线上游；相同 Event ID 只向客户端发送一次
 - EOSE 聚合
 - 上游自动重连
 - NIP-11 Relay 信息，并在后台自动填入支持的 NIPs：01、02、04、09、11、28、40、45、70、77
@@ -15,7 +14,6 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 - 独立的后台登录页与 8 小时安全会话
 - 上游 Relay 增删、启停
 - 在线客户端、客户端活跃订阅、上游活跃订阅、事件与流量统计
-- 后台可调省请求设置：统计保存间隔、COUNT 最大查询上游数
 - Cloudflare Workers GitHub CI/CD
 - 不使用 D1/R2
 
@@ -79,16 +77,16 @@ npx wrangler dev
 ## 订阅统计口径
 
 - `客户端活跃订阅`：当前客户端连接发起并仍未关闭的 `REQ` 数量。
-- `上游活跃订阅`：代理实际转发到上游 Relay、并仍在路由表中的订阅数量。一个客户端订阅会按已连接的上游 Relay 展开，所以通常会大于或等于客户端活跃订阅。
+- `上游活跃订阅`：代理实际转发到上游 Relay、并仍在路由表中的订阅数量。一个客户端订阅会按在线上游 Relay 展开；相同 Event ID 在代理内去重，只会向客户端发送一次。
 
-## 免费额度与省请求设置
-
-后台的“省请求设置”会保存到 Durable Object：
-
-- `统计保存间隔`：流量与连接统计写入 Durable Object Storage 的节流间隔，默认 30 秒。
-- `COUNT 最多查询上游数`：客户端发起 NIP-45 `COUNT` 时最多转发到多少个在线上游，默认 5 个。
+## 免费额度与请求控制
 
 前台和后台都不会自动刷新；页面只会在打开或手动刷新浏览器时读取一次状态。后台已移除“最近流量”明细，不再保存最近消息摘要，只保留汇总统计。
+
+代码内置了两个保护：
+
+- 流量与连接统计最多约每 30 秒写入一次 Durable Object Storage。
+- 客户端发起 NIP-45 `COUNT` 时最多转发到 5 个在线上游，避免大量上游同时放大查询。
 
 ## Nostr 协议支持
 
