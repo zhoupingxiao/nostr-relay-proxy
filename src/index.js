@@ -28,6 +28,8 @@ function relayState(url, extra = {}) {
   };
 }
 
+const DEFAULT_SUPPORTED_NIPS = [1, 2, 4, 9, 11, 28, 40, 45, 70, 77];
+
 function normalizeRelayUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -163,10 +165,10 @@ function trafficSummary(direction, source, raw, msg) {
     item.eventId = event?.id || null;
     item.kind = Number.isFinite(event?.kind) ? event.kind : null;
     if (direction === "download") item.subscription = String(msg?.[1] || "");
-  } else if (type === "REQ") {
+  } else if (type === "REQ" || type === "COUNT" || type === "NEG-OPEN") {
     item.subscription = String(msg?.[1] || "");
     item.filters = Math.max(0, msg.length - 2);
-  } else if (type === "CLOSE" || type === "EOSE" || type === "CLOSED") {
+  } else if (type === "CLOSE" || type === "EOSE" || type === "CLOSED" || type === "NEG-MSG" || type === "NEG-CLOSE" || type === "NEG-ERR") {
     item.subscription = String(msg?.[1] || "");
   } else if (type === "OK") {
     item.eventId = String(msg?.[1] || "");
@@ -184,7 +186,7 @@ function defaultSettings(env = {}) {
     icon: typeof env.RELAY_ICON === "string" ? env.RELAY_ICON : "",
     software: "https://github.com/zhoupingxiao/nostr-relay-proxy",
     version: "1.0.0",
-    supported_nips: parseNips(typeof env.RELAY_SUPPORTED_NIPS === "string" ? env.RELAY_SUPPORTED_NIPS : "1,11")
+    supported_nips: uniqueNips(DEFAULT_SUPPORTED_NIPS, parseNips(typeof env.RELAY_SUPPORTED_NIPS === "string" ? env.RELAY_SUPPORTED_NIPS : ""))
   };
 }
 
@@ -198,6 +200,20 @@ function parseNips(value) {
     .filter(Number.isFinite);
 }
 
+function uniqueNips(...lists) {
+  return [...new Set(lists.flat().map(x => Number(x)).filter(Number.isFinite))]
+    .sort((a, b) => a - b);
+}
+
+function mergeHll(a, b) {
+  if (!/^[0-9a-f]{512}$/i.test(String(b || ""))) return a;
+  if (!a) return String(b).toLowerCase();
+  const left = a.match(/../g) || [];
+  const right = String(b).toLowerCase().match(/../g) || [];
+  if (left.length !== 256 || right.length !== 256) return a;
+  return left.map((x, i) => Math.max(parseInt(x, 16), parseInt(right[i], 16)).toString(16).padStart(2, "0")).join("");
+}
+
 function normalizeSettings(input, env) {
   const base = defaultSettings(env);
   const nips = parseNips(input?.supported_nips);
@@ -209,7 +225,7 @@ function normalizeSettings(input, env) {
     icon: String(input?.icon || "").trim(),
     software: String(input?.software || base.software).trim() || base.software,
     version: String(input?.version || base.version).trim() || base.version,
-    supported_nips: nips.length ? nips : base.supported_nips
+    supported_nips: nips.length ? uniqueNips(base.supported_nips, nips) : base.supported_nips
   };
 }
 
@@ -416,6 +432,8 @@ export class RelayHub {
     const url = new URL(request.url);
     const clientSubscriptions = [...this.clients.values()].reduce((n, c) => n + c.subscriptions.size, 0);
     const upstreamSubscriptions = [...this.upstreams.values()].reduce((n, u) => n + u.routes.size, 0);
+    const upstreamCounts = [...this.upstreams.values()].reduce((n, u) => n + (u.countRoutes?.size || 0), 0);
+    const upstreamNegentropy = [...this.upstreams.values()].reduce((n, u) => n + (u.negRoutes?.size || 0), 0);
 
     if (url.pathname === "/status") return json({
       stats: this.stats,
@@ -424,6 +442,8 @@ export class RelayHub {
       subscriptions: clientSubscriptions,
       clientSubscriptions,
       upstreamSubscriptions,
+      upstreamCounts,
+      upstreamNegentropy,
       relays: this.relays,
       traffic: this.recentTraffic
     });
@@ -436,6 +456,8 @@ export class RelayHub {
       subscriptions: clientSubscriptions,
       clientSubscriptions,
       upstreamSubscriptions,
+      upstreamCounts,
+      upstreamNegentropy,
       stats: this.stats,
       relays: this.relays.map(({ url, enabled, connected, reconnects, lastConnectedAt, latencyMs }) => ({ url, enabled, connected, reconnects, lastConnectedAt, latencyMs }))
     }, 200, { "access-control-allow-origin": "*", "cache-control": "no-store" });
@@ -513,6 +535,8 @@ export class RelayHub {
     const state = {
       ws: server,
       subscriptions: new Map(),
+      counts: new Map(),
+      negentropy: new Map(),
       seen: new Map(),
       createdAt: Date.now()
     };
@@ -522,8 +546,8 @@ export class RelayHub {
     server.accept();
     server.serializeAttachment({ clientId });
     server.addEventListener("message", e => this.onClientMessage(clientId, e.data));
-    server.addEventListener("close", () => this.clients.delete(clientId));
-    server.addEventListener("error", () => this.clients.delete(clientId));
+    server.addEventListener("close", () => this.closeClient(clientId));
+    server.addEventListener("error", () => this.closeClient(clientId));
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -543,6 +567,9 @@ export class RelayHub {
     if (type === "EVENT") {
       const event = msg[1];
       if (!event?.id) return this.send(c, ["NOTICE", "invalid EVENT"]);
+      if (Array.isArray(event.tags) && event.tags.some(tag => Array.isArray(tag) && tag[0] === "-")) {
+        return this.send(c, ["OK", event.id, false, "auth-required: protected events are not accepted by this proxy"]);
+      }
       this.stats.events++;
       this.stats.forwarded++;
       let ok = false;
@@ -565,6 +592,30 @@ export class RelayHub {
       return;
     }
 
+    if (type === "COUNT") {
+      const subId = String(msg[1] || "");
+      const filters = msg.slice(2);
+      if (!subId || !filters.length) return;
+      const open = this.openUpstreams();
+      if (!open.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
+      const state = { filters, upstreamIds: new Map(), pending: 0, count: 0, approximate: open.length > 1, hll: "", responded: false, closedReason: "", timer: null };
+      c.counts.set(subId, state);
+      for (const u of open) {
+        const upstreamId = `${clientId}:count:${subId}:${crypto.randomUUID().slice(0, 8)}`;
+        state.upstreamIds.set(u.url, upstreamId);
+        state.pending++;
+        u.countRoutes.set(upstreamId, { clientId, subId });
+        try { u.ws.send(JSON.stringify(["COUNT", upstreamId, ...filters])); } catch {
+          state.pending--;
+          u.countRoutes.delete(upstreamId);
+          state.closedReason = "error: failed to forward count request";
+        }
+      }
+      state.timer = setTimeout(() => this.finishCount(clientId, subId, true), 1500);
+      if (state.pending <= 0) this.finishCount(clientId, subId, true);
+      return;
+    }
+
     if (type === "REQ") {
       const subId = String(msg[1] || "");
       const filters = msg.slice(2);
@@ -577,6 +628,46 @@ export class RelayHub {
         u.routes.set(upstreamId, { clientId, subId });
         try { u.ws.send(JSON.stringify(["REQ", upstreamId, ...filters])); } catch {}
       }
+      return;
+    }
+
+    if (type === "NEG-OPEN") {
+      const negId = String(msg[1] || "");
+      if (!negId) return;
+      const u = this.openUpstreams()[0];
+      if (!u) return this.send(c, ["NEG-ERR", negId, "error: no upstream relay available"]);
+      const upstreamId = `${clientId}:neg:${negId}:${crypto.randomUUID().slice(0, 8)}`;
+      c.negentropy.set(negId, { url: u.url, upstreamId });
+      u.negRoutes.set(upstreamId, { clientId, negId });
+      try { u.ws.send(JSON.stringify(["NEG-OPEN", upstreamId, ...msg.slice(2)])); } catch {
+        c.negentropy.delete(negId);
+        u.negRoutes.delete(upstreamId);
+        this.send(c, ["NEG-ERR", negId, "error: failed to open upstream negentropy session"]);
+      }
+      return;
+    }
+
+    if (type === "NEG-MSG") {
+      const negId = String(msg[1] || "");
+      const route = c.negentropy.get(negId);
+      const u = route ? this.upstreams.get(route.url) : null;
+      if (!u?.ws || u.ws.readyState !== WebSocket.OPEN) return this.send(c, ["NEG-ERR", negId, "error: upstream negentropy session is not available"]);
+      try { u.ws.send(JSON.stringify(["NEG-MSG", route.upstreamId, ...msg.slice(2)])); } catch {
+        this.send(c, ["NEG-ERR", negId, "error: failed to forward negentropy message"]);
+      }
+      return;
+    }
+
+    if (type === "NEG-CLOSE") {
+      const negId = String(msg[1] || "");
+      const route = c.negentropy.get(negId);
+      const u = route ? this.upstreams.get(route.url) : null;
+      if (u) {
+        u.negRoutes.delete(route.upstreamId);
+        if (u.ws?.readyState === WebSocket.OPEN)
+          try { u.ws.send(JSON.stringify(["NEG-CLOSE", route.upstreamId])); } catch {}
+      }
+      c.negentropy.delete(negId);
       return;
     }
 
@@ -594,6 +685,52 @@ export class RelayHub {
       }
       c.subscriptions.delete(subId);
     }
+  }
+
+  openUpstreams() {
+    return [...this.upstreams.values()].filter(u => u.ws && u.ws.readyState === WebSocket.OPEN);
+  }
+
+  closeClient(clientId) {
+    const c = this.clients.get(clientId);
+    if (!c) return;
+    for (const sub of c.subscriptions.values()) {
+      for (const [url, upstreamId] of sub.upstreamIds) {
+        const u = this.upstreams.get(url);
+        if (u) u.routes.delete(upstreamId);
+      }
+    }
+    for (const count of c.counts.values()) {
+      if (count.timer) clearTimeout(count.timer);
+      for (const [url, upstreamId] of count.upstreamIds) {
+        const u = this.upstreams.get(url);
+        if (u) u.countRoutes.delete(upstreamId);
+      }
+    }
+    for (const route of c.negentropy.values()) {
+      const u = this.upstreams.get(route.url);
+      if (u) u.negRoutes.delete(route.upstreamId);
+    }
+    this.clients.delete(clientId);
+  }
+
+  finishCount(clientId, subId, approximate = false) {
+    const c = this.clients.get(clientId);
+    const count = c?.counts.get(subId);
+    if (!c || !count) return;
+    if (count.timer) clearTimeout(count.timer);
+    for (const [url, upstreamId] of count.upstreamIds) {
+      const u = this.upstreams.get(url);
+      if (u) u.countRoutes.delete(upstreamId);
+    }
+    if (!count.responded) {
+      this.send(c, ["CLOSED", subId, count.closedReason || "error: count request was not answered by upstream relays"]);
+    } else {
+      const body = { count: count.count, approximate: count.approximate || approximate };
+      if (count.hll) body.hll = count.hll;
+      this.send(c, ["COUNT", subId, body]);
+    }
+    c.counts.delete(subId);
   }
 
   connectUpstream(url) {
@@ -614,7 +751,7 @@ export class RelayHub {
       return;
     }
     const u = {
-      url, ws, routes: new Map(), connecting: true, reconnectTimer: null,
+      url, ws, routes: new Map(), countRoutes: new Map(), negRoutes: new Map(), connecting: true, reconnectTimer: null,
       backoff: Math.min((existing?.backoff || 1000) * 2, 30000)
     };
     this.upstreams.set(url, u);
@@ -649,6 +786,23 @@ export class RelayHub {
     });
     ws.addEventListener("close", () => {
       item.connected = false;
+      for (const route of [...u.countRoutes.values()]) {
+        const c = this.clients.get(route.clientId);
+        const count = c?.counts.get(route.subId);
+        if (count) {
+          count.pending = Math.max(0, count.pending - 1);
+          count.approximate = true;
+          count.closedReason = "error: upstream relay disconnected";
+          if (count.pending === 0) this.finishCount(route.clientId, route.subId, true);
+        }
+      }
+      for (const route of [...u.negRoutes.values()]) {
+        const c = this.clients.get(route.clientId);
+        if (c) {
+          this.send(c, ["NEG-ERR", route.negId, "error: upstream relay disconnected"]);
+          c.negentropy.delete(route.negId);
+        }
+      }
       this.upstreams.delete(url);
       this.stats.reconnects++;
       item.reconnects = (item.reconnects || 0) + 1;
@@ -672,6 +826,55 @@ export class RelayHub {
     const u = this.upstreams.get(url);
     if (!u) return;
     this.recordTraffic("download", url, raw, msg);
+
+    if (msg[0] === "COUNT") {
+      const upstreamId = String(msg[1] || "");
+      const route = u.countRoutes.get(upstreamId);
+      if (!route) return;
+      const c = this.clients.get(route.clientId);
+      const count = c?.counts.get(route.subId);
+      if (!c || !count) return;
+      const body = msg[2] && typeof msg[2] === "object" ? msg[2] : {};
+      const value = Number(body.count);
+      count.count += Number.isFinite(value) ? Math.max(0, value) : 0;
+      count.approximate = count.approximate || body.approximate !== false;
+      count.hll = mergeHll(count.hll, body.hll);
+      count.responded = true;
+      count.pending = Math.max(0, count.pending - 1);
+      u.countRoutes.delete(upstreamId);
+      count.upstreamIds.delete(url);
+      if (count.pending === 0) this.finishCount(route.clientId, route.subId);
+      return;
+    }
+
+    if (msg[0] === "CLOSED" && u.countRoutes.has(String(msg[1] || ""))) {
+      const upstreamId = String(msg[1] || "");
+      const route = u.countRoutes.get(upstreamId);
+      const c = this.clients.get(route.clientId);
+      const count = c?.counts.get(route.subId);
+      u.countRoutes.delete(upstreamId);
+      if (!count) return;
+      count.upstreamIds.delete(url);
+      count.approximate = true;
+      count.closedReason = String(msg[2] || count.closedReason || "error: upstream relay closed count request");
+      count.pending = Math.max(0, count.pending - 1);
+      if (count.pending === 0) this.finishCount(route.clientId, route.subId, true);
+      return;
+    }
+
+    if (msg[0] === "NEG-MSG" || msg[0] === "NEG-ERR") {
+      const upstreamId = String(msg[1] || "");
+      const route = u.negRoutes.get(upstreamId);
+      if (!route) return;
+      const c = this.clients.get(route.clientId);
+      if (!c) return;
+      this.send(c, [msg[0], route.negId, ...msg.slice(2)]);
+      if (msg[0] === "NEG-ERR") {
+        u.negRoutes.delete(upstreamId);
+        c.negentropy.delete(route.negId);
+      }
+      return;
+    }
 
     if (msg[0] === "EVENT" && msg[1]) {
       const upstreamId = String(msg[1]);
@@ -732,6 +935,6 @@ refresh();setInterval(refresh,5000);</script></body></html>`;
 
 const LOGIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell"><div class="panel login"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy</div><h1>欢迎回来</h1><p class="muted">登录后管理上游 Relay 与实时网络状态。</p><form id="form"><input class="input" id="username" autocomplete="username" placeholder="管理员用户名" required><input class="input" id="password" type="password" autocomplete="current-password" placeholder="密码" required><button class="button primary" id="submit">安全登录</button><div class="notice" id="notice">__ERROR__</div></form></div></main><script>document.getElementById('form').onsubmit=async e=>{e.preventDefault();const b=document.getElementById('submit');b.disabled=true;b.textContent='登录中…';const user=document.getElementById('username').value;const pass=document.getElementById('password').value;const r=await fetch('/admin/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:user,password:pass})});if(r.ok){location.href='/admin';return}const d=await r.json().catch(()=>({error:'登录失败'}));const n=document.getElementById('notice');n.textContent=d.error||'登录失败';n.style.display='block';b.disabled=false;b.textContent='安全登录'}</script></body></html>`;
 
-const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell admin-shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero admin-hero"><div class="eyebrow">Control center</div><h1>Relay 网络控制台</h1><p class="lead">实时查看连接、流量与上游健康状态。更改会立即应用到当前网关。</p></section><div class="grid" id="metrics"></div><section class="admin-grid relay-admin-grid" style="margin-top:18px"><div class="panel section relay-panel"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>延迟</th><th>连接时长</th><th>转发</th><th>下载</th><th>上传</th><th>下载量</th><th>重连</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><hr style="border:0;border-top:1px solid #28445f;margin:22px 0"><h2>中继资料</h2><div class="form-row" style="flex-direction:column"><input class="input" id="set-name" placeholder="中继名称"><input class="input" id="set-desc" placeholder="描述"><input class="input" id="set-pubkey" placeholder="机主公钥 hex"><input class="input" id="set-contact" placeholder="联系方式，例如 mailto:you@example.com"><input class="input" id="set-icon" placeholder="头像 URL"><input class="input" id="set-nips" placeholder="支持的 NIPs，例如 1,11,42"><button class="button primary" id="save-settings">保存资料</button></div><div class="notice" id="settings-notice"></div><div class="muted" style="margin-top:20px">提示：上游列表和中继资料都保存在 Durable Object；Cloudflare 中的变量仅用于首次默认值。</div></aside></section><section class="panel section"><h2>最近流量</h2><p class="muted">展示客户端上传与上游返回的消息摘要，不直接展开完整事件内容。</p><div class="table-wrap"><table class="table"><thead><tr><th>时间</th><th>方向</th><th>类型</th><th>来源</th><th>数据</th><th>大小</th></tr></thead><tbody id="traffic"></tbody></table></div></section></main><script>
+const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell admin-shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero admin-hero"><div class="eyebrow">Control center</div><h1>Relay 网络控制台</h1><p class="lead">实时查看连接、流量与上游健康状态。更改会立即应用到当前网关。</p></section><div class="grid" id="metrics"></div><section class="admin-grid relay-admin-grid" style="margin-top:18px"><div class="panel section relay-panel"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>延迟</th><th>连接时长</th><th>转发</th><th>下载</th><th>上传</th><th>下载量</th><th>重连</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><hr style="border:0;border-top:1px solid #28445f;margin:22px 0"><h2>中继资料</h2><div class="form-row" style="flex-direction:column"><input class="input" id="set-name" placeholder="中继名称"><input class="input" id="set-desc" placeholder="描述"><input class="input" id="set-pubkey" placeholder="机主公钥 hex"><input class="input" id="set-contact" placeholder="联系方式，例如 mailto:you@example.com"><input class="input" id="set-icon" placeholder="头像 URL"><input class="input" id="set-nips" placeholder="支持的 NIPs，例如 1,2,4,9,11,28,40,45,70,77"><button class="button primary" id="save-settings">保存资料</button></div><div class="notice" id="settings-notice"></div><div class="muted" style="margin-top:20px">提示：上游列表和中继资料都保存在 Durable Object；Cloudflare 中的变量仅用于首次默认值。</div></aside></section><section class="panel section"><h2>最近流量</h2><p class="muted">展示客户端上传与上游返回的消息摘要，不直接展开完整事件内容。</p><div class="table-wrap"><table class="table"><thead><tr><th>时间</th><th>方向</th><th>类型</th><th>来源</th><th>数据</th><th>大小</th></tr></thead><tbody id="traffic"></tbody></table></div></section></main><script>
 const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'小时 '+m+'分';if(m)return m+'分 '+(s%60)+'秒';return s+'秒'};const size=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':(n||0)+' B';const api=async(p,o)=>{const r=await fetch(p,o);if(r.status===401){location.href='/admin';throw Error('unauthorized')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'请求失败');return d};let settingsLoaded=false;function card(label,value){let e=document.createElement('div');e.className='metric panel';e.innerHTML='<div class="value"></div><div class="label"></div>';e.children[0].textContent=value;e.children[1].textContent=label;return e}function show(msg){const n=document.getElementById('notice');n.textContent=msg;n.style.display=msg?'block':'none'}function showSettings(msg,ok=true){const n=document.getElementById('settings-notice');n.textContent=msg;n.style.display=msg?'block':'none';n.style.color=ok?'#7ef0bd':'#ffb5c3'}function normalizeRelayUrl(v){v=v.trim();if(!v)return '';const lower=v.toLowerCase();if(lower.startsWith('wss://'))return 'wss://'+v.slice(6);if(lower.startsWith('ws://'))return 'ws://'+v.slice(5);if(v.includes('://'))return v;return 'wss://'+v}function trafficText(t){if(t.eventId)return 'event '+t.eventId.slice(0,12)+(t.kind!==null&&t.kind!==undefined?' · kind '+t.kind:'');if(t.subscription)return 'sub '+t.subscription+(t.filters?' · '+t.filters+' filters':'');if(t.ok!==undefined)return t.ok?'OK':'failed';return '—'}function fillSettings(s,force=false){if(!s||!force&&settingsLoaded&&document.activeElement?.id?.startsWith('set-'))return;settingsLoaded=true;document.getElementById('set-name').value=s.name||'';document.getElementById('set-desc').value=s.description||'';document.getElementById('set-pubkey').value=s.pubkey||'';document.getElementById('set-contact').value=s.contact||'';document.getElementById('set-icon').value=s.icon||'';document.getElementById('set-nips').value=(s.supported_nips||[]).join(',')}
 async function refresh(){try{const s=await api('/admin/api/status');document.getElementById('metrics').replaceChildren(card('在线用户',s.clients),card('客户端活跃订阅',s.clientSubscriptions??s.subscriptions),card('上游活跃订阅',s.upstreamSubscriptions??0),card('上传流量',size(s.stats.uploadedBytes)),card('下载流量',size(s.stats.downloadedBytes)),card('客户端事件',s.stats.events),card('内部错误',s.stats.errors||0),card('可用上游',s.relays.filter(x=>x.connected).length+' / '+s.relays.length));fillSettings(s.settings);document.getElementById('uptime').textContent=elapsed(s.stats.startedAt);const tbody=document.getElementById('relays');tbody.replaceChildren(...s.relays.map(r=>{const tr=document.createElement('tr');const values=[r.url,r.connected?'在线':r.enabled?'离线':'已停用',r.latencyMs!==null&&r.latencyMs!==undefined?r.latencyMs+' ms':'—',r.connected?elapsed(r.lastConnectedAt):'—',r.forwardedEvents||0,r.downloadedEvents||0,size(r.uploadedBytes),size(r.downloadedBytes),r.reconnects||0,r.lastError||'—'];values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===1)td.className=r.connected?'badge on':'badge off';tr.append(td)});const actions=document.createElement('td');const toggle=document.createElement('button');toggle.className='button mini';toggle.textContent=r.enabled?'停用':'启用';toggle.onclick=()=>change('/admin/api/relays/toggle',{url:r.url,enabled:!r.enabled});const del=document.createElement('button');del.className='button danger mini';del.style.marginLeft='6px';del.textContent='删除';del.onclick=()=>{if(confirm('删除 '+r.url+'？'))change('/admin/api/relays',{url:r.url},'DELETE')};actions.append(toggle,del);tr.append(actions);return tr}));const traffic=document.getElementById('traffic');traffic.replaceChildren(...(s.traffic||[]).map(t=>{const tr=document.createElement('tr');[new Date(t.at).toLocaleTimeString(),t.direction==='upload'?'上传':'下载',t.type,t.source,trafficText(t),size(t.bytes)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});return tr}));show(s.stats.lastError?'最近内部错误：'+s.stats.lastError:'')}catch(e){show(e.message)}}async function change(path,body,method='POST'){try{await api(path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});refresh()}catch(e){show(e.message)}}async function saveSettings(){const b=document.getElementById('save-settings');b.disabled=true;b.textContent='保存中…';showSettings('正在保存…');try{const saved=await api('/admin/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:document.getElementById('set-name').value,description:document.getElementById('set-desc').value,pubkey:document.getElementById('set-pubkey').value,contact:document.getElementById('set-contact').value,icon:document.getElementById('set-icon').value,supported_nips:document.getElementById('set-nips').value})});fillSettings(saved,true);showSettings('已保存中继资料');setTimeout(()=>showSettings(''),2200)}catch(e){showSettings(e.message||'保存失败',false)}finally{b.disabled=false;b.textContent='保存资料'}}document.getElementById('add').onclick=()=>{const url=normalizeRelayUrl(document.getElementById('url').value);if(url){change('/admin/api/relays',{url});document.getElementById('url').value=''}};document.getElementById('save-settings').onclick=saveSettings;document.getElementById('url').addEventListener('blur',e=>{e.target.value=normalizeRelayUrl(e.target.value)});document.getElementById('ws').textContent=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('ws').textContent);document.getElementById('copy').textContent='已复制'};document.getElementById('logout').onclick=async()=>{await fetch('/admin/api/logout',{method:'POST'});location.href='/admin'};refresh();setInterval(refresh,5000);</script></body></html>`;
