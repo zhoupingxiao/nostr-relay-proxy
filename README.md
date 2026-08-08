@@ -11,6 +11,8 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 - 上游自动重连
 - NIP-11 Relay 信息
 - Web 管理后台
+- 公开状态首页：在线状态、用户/订阅数、Relay 连接状态与连接时长
+- 独立的后台登录页与 8 小时安全会话
 - 上游 Relay 增删、启停
 - 在线客户端/订阅/事件统计
 - Cloudflare Workers GitHub CI/CD
@@ -28,7 +30,7 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
    - `ADMIN_PASSWORD`：管理后台密码（Secret）
    - `UPSTREAM_RELAYS`：可选。首次创建 Durable Object 时导入的上游地址，以英文逗号分隔，例如 `wss://relay.example.com,wss://relay2.example.com`
 
-这些变量不会写入 `wrangler.jsonc`，也不会由 GitHub Actions 覆盖。未同时配置 `ADMIN_USER` 与 `ADMIN_PASSWORD` 时，`/admin` 会拒绝访问，不存在默认账号。
+这些变量不会写入 `wrangler.jsonc`，也不会由 GitHub Actions 覆盖。未同时配置 `ADMIN_USER` 与 `ADMIN_PASSWORD` 时，后台无法登录，不存在默认账号。
 
 ## 自定义域名
 
@@ -43,6 +45,14 @@ Nostr 客户端连接：
 后台：
 
 `https://relay.example.com/admin`
+
+公开状态页：
+
+`https://relay.example.com/`
+
+公开状态 JSON（用于监控或自定义面板）：
+
+`https://relay.example.com/status`
 
 ## 本地开发
 
@@ -59,14 +69,14 @@ npx wrangler dev
 
 ## GitHub Actions
 
-仓库包含 `.github/workflows/deploy.yml`。
+仓库包含 `.github/workflows/deploy.yml`，但已关闭 push 自动部署；需要时可在 GitHub Actions 手动运行 workflow。
 
 需要 GitHub Secrets：
 
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 
-之后 push 到 main 自动部署。
+手动运行 workflow 后会部署到 Cloudflare。也可以在本地运行 `npm run deploy`。
 
 ## 注意
 
