@@ -3,7 +3,7 @@ function configuredRelays(env) {
   // brand-new Durable Object; subsequent changes belong in the admin UI.
   return (typeof env.UPSTREAM_RELAYS === "string" ? env.UPSTREAM_RELAYS : "")
     .split(",")
-    .map(s => s.trim())
+    .map(s => normalizeRelayUrl(s))
     .filter(isRelayUrl)
     .map(url => ({
       url,
@@ -13,6 +13,15 @@ function configuredRelays(env) {
       lastError: null,
       lastConnectedAt: null
     }));
+}
+
+function normalizeRelayUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^wss:\/\//i.test(raw)) return `wss://${raw.slice(6)}`;
+  if (/^ws:\/\//i.test(raw)) return `ws://${raw.slice(5)}`;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+  return `wss://${raw}`;
 }
 
 function isRelayUrl(value) {
@@ -106,6 +115,36 @@ function unauthorized() {
 function relayUrl(request) {
   const u = new URL(request.url);
   return `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}${u.pathname}`;
+}
+
+function byteLength(value) {
+  return new TextEncoder().encode(String(value || "")).length;
+}
+
+function trafficSummary(direction, source, raw, msg) {
+  const type = Array.isArray(msg) ? String(msg[0] || "UNKNOWN") : "UNKNOWN";
+  const item = {
+    at: Date.now(),
+    direction,
+    source,
+    type,
+    bytes: byteLength(raw)
+  };
+  if (type === "EVENT") {
+    const event = direction === "upload" ? msg?.[1] : msg?.[2];
+    item.eventId = event?.id || null;
+    item.kind = Number.isFinite(event?.kind) ? event.kind : null;
+    if (direction === "download") item.subscription = String(msg?.[1] || "");
+  } else if (type === "REQ") {
+    item.subscription = String(msg?.[1] || "");
+    item.filters = Math.max(0, msg.length - 2);
+  } else if (type === "CLOSE" || type === "EOSE" || type === "CLOSED") {
+    item.subscription = String(msg?.[1] || "");
+  } else if (type === "OK") {
+    item.eventId = String(msg?.[1] || "");
+    item.ok = msg?.[2] === true;
+  }
+  return item;
 }
 
 function adminPage() {
@@ -225,14 +264,20 @@ export class RelayHub {
     this.clients = new Map();
     this.upstreams = new Map();
     this.relays = [];
-    this.stats = { events: 0, forwarded: 0, deduped: 0, connections: 0, reconnects: 0 };
+    this.stats = {
+      events: 0, forwarded: 0, deduped: 0, connections: 0, reconnects: 0,
+      uploadedMessages: 0, downloadedMessages: 0, uploadedBytes: 0, downloadedBytes: 0
+    };
+    this.recentTraffic = [];
+    this.lastPersistAt = 0;
     this.loaded = false;
   }
 
   async load() {
     if (this.loaded) return;
     this.relays = await this.state.storage.get("relays") || configuredRelays(this.env);
-    this.stats = await this.state.storage.get("stats") || this.stats;
+    this.stats = { ...this.stats, ...(await this.state.storage.get("stats") || {}) };
+    this.recentTraffic = await this.state.storage.get("recentTraffic") || [];
     if (!this.stats.startedAt) {
       this.stats.startedAt = Date.now();
       await this.state.storage.put("stats", this.stats);
@@ -244,6 +289,22 @@ export class RelayHub {
   async persist() {
     await this.state.storage.put("relays", this.relays);
     await this.state.storage.put("stats", this.stats);
+    await this.state.storage.put("recentTraffic", this.recentTraffic);
+    this.lastPersistAt = Date.now();
+  }
+
+  recordTraffic(direction, source, raw, msg) {
+    const entry = trafficSummary(direction, source, raw, msg);
+    if (direction === "upload") {
+      this.stats.uploadedMessages++;
+      this.stats.uploadedBytes += entry.bytes;
+    } else {
+      this.stats.downloadedMessages++;
+      this.stats.downloadedBytes += entry.bytes;
+    }
+    this.recentTraffic.unshift(entry);
+    this.recentTraffic = this.recentTraffic.slice(0, 60);
+    if (Date.now() - this.lastPersistAt > 10000) this.persist().catch(() => {});
   }
 
   async fetch(request) {
@@ -254,7 +315,8 @@ export class RelayHub {
       stats: this.stats,
       clients: this.clients.size,
       subscriptions: [...this.clients.values()].reduce((n, c) => n + c.subscriptions.size, 0),
-      relays: this.relays
+      relays: this.relays,
+      traffic: this.recentTraffic
     });
 
     if (url.pathname === "/public-status") return json({
@@ -271,7 +333,7 @@ export class RelayHub {
 
     if (url.pathname === "/relays" && request.method === "POST") {
       const body = await request.json();
-      const relay = String(body.url || "").trim();
+      const relay = normalizeRelayUrl(body.url);
       if (!isRelayUrl(relay)) return json({ error: "invalid relay url" }, 400);
       if (!this.relays.some(r => r.url === relay)) {
         const item = { url: relay, enabled: true, connected: false, reconnects: 0, lastError: null, lastConnectedAt: null };
@@ -347,6 +409,7 @@ export class RelayHub {
       return;
     }
     if (!Array.isArray(msg) || !msg[0]) return;
+    this.recordTraffic("upload", "client", raw, msg);
     const type = msg[0];
 
     if (type === "EVENT") {
@@ -452,6 +515,7 @@ export class RelayHub {
     if (!Array.isArray(msg) || !msg[0]) return;
     const u = this.upstreams.get(url);
     if (!u) return;
+    this.recordTraffic("download", url, raw, msg);
 
     if (msg[0] === "EVENT" && msg[1]) {
       const upstreamId = String(msg[1]);
@@ -507,11 +571,11 @@ const HOME_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"
 const wsUrl=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(wsUrl);document.getElementById('copy').textContent='已复制 '+wsUrl;setTimeout(()=>document.getElementById('copy').textContent='复制连接地址',1800)};
 const ago=n=>{if(!n)return '—';let s=Math.max(0,Math.floor((Date.now()-n)/1000));let h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h? h+' 小时 '+m+' 分钟':m?m+' 分钟':'刚刚'};
 function metric(label,value){let el=document.createElement('div');el.className='metric panel';el.innerHTML='<div class="value"></div><div class="label"></div>';el.children[0].textContent=value;el.children[1].textContent=label;return el}
-async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const s=await r.json();const active=s.relays.filter(x=>x.connected).length;const dot=document.getElementById('dot');dot.className='dot '+(s.online?'on':'');document.getElementById('summary').textContent=s.online?'服务在线 · '+active+' 个上游已连接':'正在等待上游 Relay 连接';document.getElementById('updated').textContent='更新于 '+new Date().toLocaleTimeString();const metrics=document.getElementById('metrics');metrics.replaceChildren(metric('在线用户',s.clients),metric('活跃订阅',s.subscriptions),metric('可用 Relay',active+' / '+s.relays.length),metric('服务运行',ago(s.stats.startedAt)));const list=document.getElementById('relays');list.replaceChildren(...s.relays.map(x=>{let row=document.createElement('div');row.className='relay';let left=document.createElement('div');let name=document.createElement('div');name.className='relay-name';name.textContent=x.url;let meta=document.createElement('div');meta.className='muted';meta.textContent=x.connected?'已连接 '+ago(x.lastConnectedAt):x.enabled?'等待重连 · 已重连 '+x.reconnects+' 次':'已由管理员停用';left.append(name,meta);let badge=document.createElement('span');badge.className='badge '+(x.connected?'on':'off');badge.textContent=x.connected?'在线':'离线';row.append(left,badge);return row}));}catch{document.getElementById('summary').textContent='暂时无法读取状态';}}
+async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const s=await r.json();const active=s.relays.filter(x=>x.connected).length;const dot=document.getElementById('dot');dot.className='dot '+(s.online?'on':'');document.getElementById('summary').textContent=s.online?'服务在线 · '+active+' 个上游已连接':'正在等待上游 Relay 连接';document.getElementById('updated').textContent='更新于 '+new Date().toLocaleTimeString();const metrics=document.getElementById('metrics');metrics.replaceChildren(metric('在线用户',s.clients),metric('活跃订阅 REQ',s.subscriptions),metric('可用 Relay',active+' / '+s.relays.length),metric('服务运行',ago(s.stats.startedAt)));const list=document.getElementById('relays');list.replaceChildren(...s.relays.map(x=>{let row=document.createElement('div');row.className='relay';let left=document.createElement('div');let name=document.createElement('div');name.className='relay-name';name.textContent=x.url;let meta=document.createElement('div');meta.className='muted';meta.textContent=x.connected?'已连接 '+ago(x.lastConnectedAt):x.enabled?'等待重连 · 已重连 '+x.reconnects+' 次':'已由管理员停用';left.append(name,meta);let badge=document.createElement('span');badge.className='badge '+(x.connected?'on':'off');badge.textContent=x.connected?'在线':'离线';row.append(left,badge);return row}));}catch{document.getElementById('summary').textContent='暂时无法读取状态';}}
 refresh();setInterval(refresh,5000);</script></body></html>`;
 
 const LOGIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell"><div class="panel login"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy</div><h1>欢迎回来</h1><p class="muted">登录后管理上游 Relay 与实时网络状态。</p><form id="form"><input class="input" id="username" autocomplete="username" placeholder="管理员用户名" required><input class="input" id="password" type="password" autocomplete="current-password" placeholder="密码" required><button class="button primary" id="submit">安全登录</button><div class="notice" id="notice">__ERROR__</div></form></div></main><script>document.getElementById('form').onsubmit=async e=>{e.preventDefault();const b=document.getElementById('submit');b.disabled=true;b.textContent='登录中…';const user=document.getElementById('username').value;const pass=document.getElementById('password').value;const r=await fetch('/admin/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:user,password:pass})});if(r.ok){location.href='/admin';return}const d=await r.json().catch(()=>({error:'登录失败'}));const n=document.getElementById('notice');n.textContent=d.error||'登录失败';n.style.display='block';b.disabled=false;b.textContent='安全登录'}</script></body></html>`;
 
-const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero" style="padding-bottom:28px"><div class="eyebrow">Control center</div><h1 style="font-size:clamp(34px,5vw,52px)">Relay 网络控制台</h1><p class="lead">实时查看连接、流量与上游健康状态。更改会立即应用到当前网关。</p></section><div class="grid" id="metrics"></div><section class="admin-grid" style="margin-top:18px"><div class="panel section"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="wss://relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>连接时长</th><th>重连</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><div class="muted" style="margin-top:20px">提示：上游列表一旦创建后由这里管理；Cloudflare 中的 UPSTREAM_RELAYS 仅用于首次初始化。</div></aside></section></main><script>
-const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'小时 '+m+'分':m+'分 '+(s%60)+'秒':s+'秒'};const api=async(p,o)=>{const r=await fetch(p,o);if(r.status===401){location.href='/admin';throw Error('unauthorized')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'请求失败');return d};function card(label,value){let e=document.createElement('div');e.className='metric panel';e.innerHTML='<div class="value"></div><div class="label"></div>';e.children[0].textContent=value;e.children[1].textContent=label;return e}function show(msg){const n=document.getElementById('notice');n.textContent=msg;n.style.display=msg?'block':'none'};
-async function refresh(){try{const s=await api('/admin/api/status');document.getElementById('metrics').replaceChildren(card('在线用户',s.clients),card('活跃订阅',s.subscriptions),card('已转发事件',s.stats.forwarded),card('去重事件',s.stats.deduped),card('上游重连',s.stats.reconnects),card('可用上游',s.relays.filter(x=>x.connected).length+' / '+s.relays.length));document.getElementById('uptime').textContent=elapsed(s.stats.startedAt);const tbody=document.getElementById('relays');tbody.replaceChildren(...s.relays.map(r=>{const tr=document.createElement('tr');const values=[r.url,r.connected?'在线':r.enabled?'离线':'已停用',r.connected?elapsed(r.lastConnectedAt):'—',r.reconnects||0];values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===1)td.className=r.connected?'badge on':'badge off';tr.append(td)});const actions=document.createElement('td');const toggle=document.createElement('button');toggle.className='button mini';toggle.textContent=r.enabled?'停用':'启用';toggle.onclick=()=>change('/admin/api/relays/toggle',{url:r.url,enabled:!r.enabled});const del=document.createElement('button');del.className='button danger mini';del.style.marginLeft='6px';del.textContent='删除';del.onclick=()=>{if(confirm('删除 '+r.url+'？'))change('/admin/api/relays',{url:r.url},'DELETE')};actions.append(toggle,del);tr.append(actions);return tr}));show('')}catch(e){show(e.message)}}async function change(path,body,method='POST'){try{await api(path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});refresh()}catch(e){show(e.message)}}document.getElementById('add').onclick=()=>{const url=document.getElementById('url').value.trim();if(url){change('/admin/api/relays',{url});document.getElementById('url').value=''}};document.getElementById('ws').textContent=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('ws').textContent);document.getElementById('copy').textContent='已复制'};document.getElementById('logout').onclick=async()=>{await fetch('/admin/api/logout',{method:'POST'});location.href='/admin'};refresh();setInterval(refresh,5000);</script></body></html>`;
+const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero" style="padding-bottom:28px"><div class="eyebrow">Control center</div><h1 style="font-size:clamp(34px,5vw,52px)">Relay 网络控制台</h1><p class="lead">实时查看连接、流量与上游健康状态。更改会立即应用到当前网关。</p></section><div class="grid" id="metrics"></div><section class="admin-grid" style="margin-top:18px"><div class="panel section"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>连接时长</th><th>重连</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><div class="muted" style="margin-top:20px">提示：上游列表已经由 Durable Object 持久保存；Cloudflare 中的 UPSTREAM_RELAYS 仅用于首次初始化。</div></aside></section><section class="panel section"><h2>最近流量</h2><p class="muted">展示客户端上传与上游返回的消息摘要，不直接展开完整事件内容。</p><div class="table-wrap"><table class="table"><thead><tr><th>时间</th><th>方向</th><th>类型</th><th>来源</th><th>数据</th><th>大小</th></tr></thead><tbody id="traffic"></tbody></table></div></section></main><script>
+const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'小时 '+m+'分':m+'分 '+(s%60)+'秒':s+'秒'};const size=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':(n||0)+' B';const api=async(p,o)=>{const r=await fetch(p,o);if(r.status===401){location.href='/admin';throw Error('unauthorized')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'请求失败');return d};function card(label,value){let e=document.createElement('div');e.className='metric panel';e.innerHTML='<div class="value"></div><div class="label"></div>';e.children[0].textContent=value;e.children[1].textContent=label;return e}function show(msg){const n=document.getElementById('notice');n.textContent=msg;n.style.display=msg?'block':'none'};function normalizeRelayUrl(v){v=v.trim();if(!v)return '';if(/^wss:\\/\\//i.test(v))return 'wss://'+v.slice(6);if(/^ws:\\/\\//i.test(v))return 'ws://'+v.slice(5);return 'wss://'+v}function trafficText(t){if(t.eventId)return 'event '+t.eventId.slice(0,12)+(t.kind!==null&&t.kind!==undefined?' · kind '+t.kind:'');if(t.subscription)return 'sub '+t.subscription+(t.filters?' · '+t.filters+' filters':'');if(t.ok!==undefined)return t.ok?'OK':'failed';return '—'}
+async function refresh(){try{const s=await api('/admin/api/status');document.getElementById('metrics').replaceChildren(card('在线用户',s.clients),card('活跃订阅 REQ',s.subscriptions),card('上传流量',size(s.stats.uploadedBytes)),card('下载流量',size(s.stats.downloadedBytes)),card('已转发事件',s.stats.forwarded),card('可用上游',s.relays.filter(x=>x.connected).length+' / '+s.relays.length));document.getElementById('uptime').textContent=elapsed(s.stats.startedAt);const tbody=document.getElementById('relays');tbody.replaceChildren(...s.relays.map(r=>{const tr=document.createElement('tr');const values=[r.url,r.connected?'在线':r.enabled?'离线':'已停用',r.connected?elapsed(r.lastConnectedAt):'—',r.reconnects||0,r.lastError||'—'];values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===1)td.className=r.connected?'badge on':'badge off';tr.append(td)});const actions=document.createElement('td');const toggle=document.createElement('button');toggle.className='button mini';toggle.textContent=r.enabled?'停用':'启用';toggle.onclick=()=>change('/admin/api/relays/toggle',{url:r.url,enabled:!r.enabled});const del=document.createElement('button');del.className='button danger mini';del.style.marginLeft='6px';del.textContent='删除';del.onclick=()=>{if(confirm('删除 '+r.url+'？'))change('/admin/api/relays',{url:r.url},'DELETE')};actions.append(toggle,del);tr.append(actions);return tr}));const traffic=document.getElementById('traffic');traffic.replaceChildren(...(s.traffic||[]).map(t=>{const tr=document.createElement('tr');[new Date(t.at).toLocaleTimeString(),t.direction==='upload'?'上传':'下载',t.type,t.source,trafficText(t),size(t.bytes)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});return tr}));show('')}catch(e){show(e.message)}}async function change(path,body,method='POST'){try{await api(path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});refresh()}catch(e){show(e.message)}}document.getElementById('add').onclick=()=>{const url=normalizeRelayUrl(document.getElementById('url').value);if(url){change('/admin/api/relays',{url});document.getElementById('url').value=''}};document.getElementById('url').addEventListener('blur',e=>{e.target.value=normalizeRelayUrl(e.target.value)});document.getElementById('ws').textContent=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('ws').textContent);document.getElementById('copy').textContent='已复制'};document.getElementById('logout').onclick=async()=>{await fetch('/admin/api/logout',{method:'POST'});location.href='/admin'};refresh();setInterval(refresh,5000);</script></body></html>`;

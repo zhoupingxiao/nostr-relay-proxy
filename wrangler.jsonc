@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nostr-relay-proxy-admin",
+  "name": "nostr-relay-proxy",
   "main": "src/index.js",
   "compatibility_date": "2026-08-08",
   "observability": { "enabled": true },
