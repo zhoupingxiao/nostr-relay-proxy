@@ -46,6 +46,14 @@ Nostr 客户端连接：
 
 `https://relay.example.com/admin`
 
+NIP-11 中继资料：
+
+`https://relay.example.com/nip11`
+
+或使用客户端标准请求：
+
+`curl -H 'Accept: application/nostr+json' https://relay.example.com/`
+
 公开状态页：
 
 `https://relay.example.com/`
