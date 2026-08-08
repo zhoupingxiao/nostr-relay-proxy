@@ -123,6 +123,12 @@ export default {
     }
 
     if (url.pathname === "/") {
+      // Nostr clients connect to the root URL with a WebSocket upgrade. This
+      // must be handled before returning the human-facing homepage.
+      if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+        const id = env.RELAY.idFromName("global");
+        return env.RELAY.get(id).fetch(request);
+      }
       if (request.headers.get("accept")?.includes("application/json")) {
         return json({ name: "nostr-relay-proxy", websocket: relayUrl(request), status: `${url.origin}/status`, admin: `${url.origin}/admin` });
       }
