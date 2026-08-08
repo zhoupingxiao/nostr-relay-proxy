@@ -145,7 +145,10 @@ export default {
         const body = await request.json().catch(() => ({}));
         const username = typeof env.ADMIN_USER === "string" ? env.ADMIN_USER : "";
         const password = typeof env.ADMIN_PASSWORD === "string" ? env.ADMIN_PASSWORD : "";
-        if (!username || !password || body.username !== username || body.password !== password) return json({ error: "用户名或密码错误" }, 401);
+        if (!username || !password) {
+          return json({ error: "当前 Worker 未读取到 ADMIN_USER 或 ADMIN_PASSWORD，请在 Variables and Secrets 保存并部署到当前环境。" }, 503);
+        }
+        if (body.username !== username || body.password !== password) return json({ error: "用户名或密码错误" }, 401);
         const session = await createSession(username, password);
         return json({ ok: true }, 200, { "set-cookie": sessionCookie(request, session, 28800) });
       }
