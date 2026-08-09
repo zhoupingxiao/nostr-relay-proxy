@@ -34,6 +34,7 @@ function relayState(url, extra = {}) {
 const DEFAULT_SUPPORTED_NIPS = [1, 11, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
 const DEFAULT_MAX_COUNT_RELAYS = 5;
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 function normalizeRelayUrl(value) {
   const raw = String(value || "").trim();
@@ -52,6 +53,48 @@ function isRelayUrl(value) {
   } catch {
     return false;
   }
+}
+
+function bech32Polymod(values) {
+  let check = 1;
+  for (const value of values) {
+    const top = check >>> 25;
+    check = ((check & 0x1ffffff) << 5) ^ value;
+    if (top & 1) check ^= 0x3b6a57b2;
+    if (top & 2) check ^= 0x26508e6d;
+    if (top & 4) check ^= 0x1ea119fa;
+    if (top & 8) check ^= 0x3d4233dd;
+    if (top & 16) check ^= 0x2a1462b3;
+  }
+  return check >>> 0;
+}
+
+function decodeNpub(value) {
+  const input = String(value || "").trim();
+  if (/^[0-9a-f]{64}$/i.test(input)) return input.toLowerCase();
+  if (!input || (input !== input.toLowerCase() && input !== input.toUpperCase())) return "";
+  const bech32 = input.toLowerCase();
+  const separator = bech32.lastIndexOf("1");
+  if (bech32.slice(0, separator) !== "npub" || separator < 1 || separator + 7 > bech32.length) return "";
+  const values = [...bech32.slice(separator + 1)].map(char => BECH32_CHARSET.indexOf(char));
+  if (values.some(value => value < 0)) return "";
+  const expanded = [..."npub"].map(char => char.charCodeAt(0) >> 5)
+    .concat(0, [..."npub"].map(char => char.charCodeAt(0) & 31), values);
+  if (bech32Polymod(expanded) !== 1) return "";
+  const payload = values.slice(0, -6);
+  const bytes = [];
+  let accumulator = 0;
+  let bits = 0;
+  for (const part of payload) {
+    accumulator = (accumulator << 5) | part;
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push((accumulator >> bits) & 255);
+    }
+  }
+  if (bits >= 5 || ((accumulator << (8 - bits)) & 255) || bytes.length !== 32) return "";
+  return bytes.map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function json(data, status = 200, extraHeaders = {}) {
@@ -186,7 +229,7 @@ function defaultSettings(env = {}) {
   return {
     name: typeof env.RELAY_NAME === "string" ? env.RELAY_NAME : "Nostr Relay Proxy",
     description: typeof env.RELAY_DESCRIPTION === "string" ? env.RELAY_DESCRIPTION : "Multi-relay Nostr aggregation proxy",
-    pubkey: typeof env.RELAY_PUBKEY === "string" ? env.RELAY_PUBKEY : "",
+    pubkey: decodeNpub(env.RELAY_PUBKEY),
     contact: typeof env.RELAY_CONTACT === "string" ? env.RELAY_CONTACT : "",
     icon: typeof env.RELAY_ICON === "string" ? env.RELAY_ICON : "",
     software: "https://github.com/zhoupingxiao/nostr-relay-proxy",
@@ -209,7 +252,7 @@ function normalizeSettings(input, env) {
   return {
     name: String(input?.name || base.name).trim() || base.name,
     description: String(input?.description || "").trim() || base.description,
-    pubkey: String(input?.pubkey || "").trim(),
+    pubkey: decodeNpub(input?.pubkey),
     contact: String(input?.contact || "").trim(),
     icon: String(input?.icon || "").trim(),
     software: String(input?.software || base.software).trim() || base.software,
