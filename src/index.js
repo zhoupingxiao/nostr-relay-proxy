@@ -37,7 +37,8 @@ const DEFAULT_SUPPORTED_NIPS = [1, 11, 42, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
 const DEFAULT_MAX_SECONDARY_RELAYS = 2;
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
-const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 5;
+const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 20;
+const DEFAULT_MAX_SUBSCRIPTION_BYTES = 48 * 1024;
 const PUBLIC_STATUS_CACHE_SECONDS = 60;
 const NIP11_CACHE_SECONDS = 300;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -800,7 +801,7 @@ export class RelayHub {
     if (type === "COUNT") {
       const subId = String(msg[1] || "");
       const filters = msg.slice(2);
-      if (!this.validSubscriptionRequest(subId, filters))
+      if (!this.validSubscriptionRequest(subId, filters, raw))
         return this.send(c, ["CLOSED", subId, "rate-limited: subscription request is too large"]);
       const open = this.preferredUpstreams();
       if (!open.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
@@ -825,7 +826,7 @@ export class RelayHub {
     if (type === "REQ") {
       const subId = String(msg[1] || "");
       const filters = msg.slice(2);
-      if (!this.validSubscriptionRequest(subId, filters))
+      if (!this.validSubscriptionRequest(subId, filters, raw))
         return this.send(c, ["CLOSED", subId, "rate-limited: subscription request is too large"]);
       if (!c.subscriptions.has(subId) && c.subscriptions.size >= DEFAULT_MAX_CLIENT_SUBSCRIPTIONS)
         return this.send(c, ["CLOSED", subId, "rate-limited: too many active subscriptions"]);
@@ -955,9 +956,10 @@ export class RelayHub {
     return this.settings.priorityRelay ? DEFAULT_MAX_SECONDARY_RELAYS + 1 : DEFAULT_MAX_SECONDARY_RELAYS;
   }
 
-  validSubscriptionRequest(subId, filters) {
+  validSubscriptionRequest(subId, filters, raw = "") {
     return subId.length > 0 && subId.length <= 64 &&
       filters.length > 0 && filters.length <= DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION &&
+      byteLength(raw) <= DEFAULT_MAX_SUBSCRIPTION_BYTES &&
       filters.every(filter => filter && typeof filter === "object" && !Array.isArray(filter));
   }
 
