@@ -1,3 +1,5 @@
+import { verifyEvent } from "nostr-tools/pure";
+
 function configuredRelays(env) {
   // This binding is configured in the Cloudflare dashboard. It seeds only a
   // brand-new Durable Object; subsequent changes belong in the admin UI.
@@ -31,7 +33,7 @@ function relayState(url, extra = {}) {
 // Only advertise relay-side protocol features implemented by this proxy.
 // Event-format NIPs (such as 2, 4, 9, 28 and 40) are transparently forwarded
 // to upstream relays but are not features implemented by this relay itself.
-const DEFAULT_SUPPORTED_NIPS = [1, 11, 45, 77];
+const DEFAULT_SUPPORTED_NIPS = [1, 11, 42, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
 const DEFAULT_MAX_SECONDARY_RELAYS = 2;
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
@@ -280,6 +282,8 @@ function defaultSettings(env = {}) {
     version: "1.0.0",
     priorityRelay: "",
     statusRefreshSeconds: 60,
+    accessMode: "all",
+    accessPubkeys: [],
     supported_nips: DEFAULT_SUPPORTED_NIPS
   };
 }
@@ -288,6 +292,19 @@ function statusRefreshSeconds(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds)) return 60;
   return Math.min(900, Math.max(60, Math.round(seconds)));
+}
+
+function accessMode(value) {
+  return ["all", "whitelist", "blacklist"].includes(value) ? value : "all";
+}
+
+function accessPubkeys(value) {
+  const values = Array.isArray(value) ? value : String(value || "").split(/[\s,;]+/);
+  return [...new Set(values.map(decodeNpub).filter(Boolean))].slice(0, 500);
+}
+
+function relayHost(value) {
+  try { return new URL(value).host.toLowerCase(); } catch { return ""; }
 }
 
 function mergeHll(a, b) {
@@ -311,6 +328,8 @@ function normalizeSettings(input, env) {
     version: String(input?.version || base.version).trim() || base.version,
     priorityRelay: isRelayUrl(normalizeRelayUrl(input?.priorityRelay)) ? normalizeRelayUrl(input?.priorityRelay) : "",
     statusRefreshSeconds: statusRefreshSeconds(input?.statusRefreshSeconds),
+    accessMode: accessMode(input?.accessMode),
+    accessPubkeys: accessPubkeys(input?.accessPubkeys),
     supported_nips: DEFAULT_SUPPORTED_NIPS
   };
 }
@@ -332,12 +351,14 @@ function adminPage() {
 
 function renderAdminHtml() {
   const mobileTableStyle = `<style>.relay-panel .table th:first-child,.relay-panel .table td:first-child{width:1%;min-width:0!important;white-space:nowrap}@media(max-width:720px){.relay-panel,.relay-panel .table-wrap{min-width:0}.relay-panel .table-wrap{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}.relay-panel .table{display:table;width:max-content;min-width:100%}.relay-panel .table thead{display:table-header-group}.relay-panel .table tbody{display:table-row-group}.relay-panel .table tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.relay-panel .table th,.relay-panel .table td{display:table-cell;width:1%;min-width:auto!important;white-space:nowrap!important;padding:8px 7px;border-bottom:1px solid #222b37;text-align:left;word-break:normal}.relay-panel .table td::before{display:none}}</style>`;
-  const refreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
+  const refreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join('\n'))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
   return ADMIN_HTML
     .replace('打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。', '上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。')
+    .replace('支持的 NIPs（由程序自动声明）：01、11、45、77', '支持的 NIPs（由程序自动声明）：01、11、42、45、77')
     .replace('<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><button class="button primary" id="save-settings">保存资料和优先中继</button>', '<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><label class="muted" for="set-status-refresh">上游列表刷新间隔（秒，最低 60）</label><input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>')
-    .replace('priorityRelay:document.getElementById(\'set-priority-relay\').value})', 'priorityRelay:document.getElementById(\'set-priority-relay\').value,statusRefreshSeconds:document.getElementById(\'set-status-refresh\').value})')
-    .replace('已保存中继资料和优先中继', '已保存中继资料、优先中继和刷新间隔')
+    .replace('<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>', '<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>访问控制</h2><p class="muted" style="margin:0">白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行填入一个用户公钥（hex 或 npub）。</p><select class="input" id="set-access-mode"><option value="all">全部：所有用户可使用</option><option value="whitelist">白名单：仅列表内用户</option><option value="blacklist">黑名单：拒绝列表内用户</option></select><textarea class="input" id="set-access-pubkeys" rows="6" placeholder="npub1… 或 64 位 hex 公钥，每行一个"></textarea><button class="button primary" id="save-settings">保存资料和运行设置</button>')
+    .replace('priorityRelay:document.getElementById(\'set-priority-relay\').value})', 'priorityRelay:document.getElementById(\'set-priority-relay\').value,statusRefreshSeconds:document.getElementById(\'set-status-refresh\').value,accessMode:document.getElementById(\'set-access-mode\').value,accessPubkeys:document.getElementById(\'set-access-pubkeys\').value})')
+    .replace('已保存中继资料和优先中继', '已保存中继资料、优先中继、刷新间隔和访问控制')
     .replaceAll('保存资料和优先中继', '保存资料和运行设置')
     .replace('</head>', `${mobileTableStyle}</head>`)
     .replace('</body>', `${refreshScript}</body>`);
@@ -595,6 +616,11 @@ export class RelayHub {
       if (this.settings.priorityRelay && !this.relays.some(relay => relay.url === this.settings.priorityRelay))
         this.settings.priorityRelay = "";
       await this.persist();
+      if (this.settings.accessMode !== "all") {
+        for (const client of this.clients.values()) {
+          if (!client.authenticatedPubkeys.size) this.send(client, ["AUTH", client.authChallenge]);
+        }
+      }
       return json(this.settings);
     }
 
@@ -660,6 +686,9 @@ export class RelayHub {
       counts: new Map(),
       negentropy: new Map(),
       seen: new Map(),
+      authenticatedPubkeys: new Set(),
+      authChallenge: crypto.randomUUID(),
+      relayHost: relayHost(request.url),
       createdAt: Date.now()
     };
     this.clients.set(clientId, state);
@@ -670,6 +699,9 @@ export class RelayHub {
     server.addEventListener("message", e => this.onClientMessage(clientId, e.data));
     server.addEventListener("close", () => this.closeClient(clientId));
     server.addEventListener("error", () => this.closeClient(clientId));
+
+    if (this.settings.accessMode !== "all")
+      this.send(state, ["AUTH", state.authChallenge]);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -685,6 +717,13 @@ export class RelayHub {
     if (!Array.isArray(msg) || !msg[0]) return;
     this.recordTraffic("upload", "client", raw, msg);
     const type = msg[0];
+
+    if (type === "AUTH") return this.authenticateClient(c, msg[1]);
+
+    if (type !== "CLOSE") {
+      const access = this.clientAccess(c);
+      if (!access.allowed) return this.rejectClientMessage(c, msg, access.reason);
+    }
 
     if (type === "EVENT") {
       const event = msg[1];
@@ -800,6 +839,44 @@ export class RelayHub {
       const subId = String(msg[1] || "");
       this.closeSubscription(c, subId);
     }
+  }
+
+  authenticateClient(c, event) {
+    const eventId = typeof event?.id === "string" ? event.id : "";
+    const fail = reason => this.send(c, ["OK", eventId, false, reason]);
+    if (!event || event.kind !== 22242 || !/^[0-9a-f]{64}$/i.test(event.pubkey || ""))
+      return fail("invalid: expected a NIP-42 authentication event");
+    if (!Number.isFinite(event.created_at) || Math.abs(Date.now() / 1000 - event.created_at) > 600)
+      return fail("invalid: authentication event is expired");
+    const challenge = event.tags?.find(tag => Array.isArray(tag) && tag[0] === "challenge")?.[1];
+    const relay = event.tags?.find(tag => Array.isArray(tag) && tag[0] === "relay")?.[1];
+    if (challenge !== c.authChallenge || relayHost(relay) !== c.relayHost)
+      return fail("invalid: authentication challenge or relay does not match");
+    if (!verifyEvent(event)) return fail("invalid: authentication signature is invalid");
+    c.authenticatedPubkeys.add(event.pubkey.toLowerCase());
+    this.send(c, ["OK", eventId, true, "authenticated"]);
+  }
+
+  clientAccess(c) {
+    const mode = this.settings.accessMode;
+    if (mode === "all") return { allowed: true };
+    if (!c.authenticatedPubkeys.size)
+      return { allowed: false, reason: "auth-required: authenticate with NIP-42 to use this relay" };
+    const listed = this.settings.accessPubkeys.some(pubkey => c.authenticatedPubkeys.has(pubkey));
+    if (mode === "whitelist" && !listed)
+      return { allowed: false, reason: "restricted: this pubkey is not on the relay whitelist" };
+    if (mode === "blacklist" && listed)
+      return { allowed: false, reason: "restricted: this pubkey is blocked by the relay" };
+    return { allowed: true };
+  }
+
+  rejectClientMessage(c, msg, reason) {
+    const type = msg[0];
+    if (type === "EVENT") return this.send(c, ["OK", String(msg[1]?.id || ""), false, reason]);
+    if (type === "REQ" || type === "COUNT") return this.send(c, ["CLOSED", String(msg[1] || ""), reason]);
+    if (type === "NEG-OPEN" || type === "NEG-MSG" || type === "NEG-CLOSE")
+      return this.send(c, ["NEG-ERR", String(msg[1] || ""), reason]);
+    return this.send(c, ["NOTICE", reason]);
   }
 
   openUpstreams() {
