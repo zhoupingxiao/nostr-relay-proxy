@@ -364,20 +364,27 @@ function renderAdminHtml() {
   const mobileTableStyle = `<style>@media(min-width:901px){.relay-admin-grid{grid-template-columns:minmax(0,2fr) minmax(420px,1fr)}}.relay-panel .table th:first-child,.relay-panel .table td:first-child{width:1%;min-width:0!important;white-space:nowrap}@media(max-width:720px){.relay-panel,.relay-panel .table-wrap{min-width:0}.relay-panel .table-wrap{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}.relay-panel .table{display:table;width:max-content;min-width:100%}.relay-panel .table thead{display:table-header-group}.relay-panel .table tbody{display:table-row-group}.relay-panel .table tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.relay-panel .table th,.relay-panel .table td{display:table-cell;width:1%;min-width:auto!important;white-space:nowrap!important;padding:8px 7px;border-bottom:1px solid #222b37;text-align:left;word-break:normal}.relay-panel .table td::before{display:none}}</style>`;
   const refreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join('\n'))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
   const adminRefreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join(String.fromCharCode(10)))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
+  const activeUsersScript = `<script>(()=>{window.renderAccessUsers=status=>{const list=document.getElementById('active-users');const detail=document.getElementById('active-users-detail');if(!list||!detail)return;const mode=status.settings?.accessMode||'all';const users=status.activeUsers||[];if(mode==='all'){detail.textContent='全部模式按在线连接计数；客户端未认证时无法识别其公钥。';list.replaceChildren();return}detail.textContent='当前 '+users.length+' 个已认证且通过规则的用户；已认证公钥总数 '+(status.authenticatedUsers??0)+'。';list.replaceChildren(...users.map(pubkey=>{const row=document.createElement('div');row.className='relay';const name=document.createElement('div');name.className='relay-name';name.textContent=pubkey.slice(0,16)+'…'+pubkey.slice(-10);name.title=pubkey;const copy=document.createElement('button');copy.className='copy';copy.textContent='复制';copy.onclick=async()=>{await navigator.clipboard.writeText(pubkey);copy.textContent='已复制'};row.append(name,copy);return row}));if(!users.length)list.innerHTML='<div class="muted">暂无有效用户</div>'}})()</script>`;
   return ADMIN_HTML
     .replace('打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。', '上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。')
     .replace('支持的 NIPs（由程序自动声明）：01、11、45、77', '支持的 NIPs（由程序自动声明）：01、11、42、45、77')
     .replace('<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><button class="button primary" id="save-settings">保存资料和优先中继</button>', '<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><label class="muted" for="set-status-refresh">上游列表刷新间隔（秒，最低 60）</label><input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>')
     .replace('<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>', '<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>访问控制</h2><p class="muted" style="margin:0">白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行填入一个用户公钥（hex 或 npub）。</p><select class="input" id="set-access-mode"><option value="all">全部</option><option value="whitelist">白名单</option><option value="blacklist">黑名单</option></select><textarea class="input" id="set-access-pubkeys" rows="8" wrap="off" style="min-width:0;white-space:pre;overflow-x:auto" placeholder="npub1… 或 64 位 hex 公钥，每行一个"></textarea><button class="button primary" id="save-settings">保存资料和运行设置</button>')
+    .replace('</aside>', '<hr style="border:0;border-top:1px solid #28445f;margin:22px 0"><h2>当前有效用户</h2><p class="muted" id="active-users-detail">加载中…</p><div class="relay-list" id="active-users"></div></aside>')
+    .replace("const s=await api('/admin/api/status');", "const s=await api('/admin/api/status');window.renderAccessUsers?.(s);")
+    .replace("card('在线用户',s.clients),", "card(s.settings?.accessMode==='all'?'在线连接':'有效用户',s.clients),card('已认证用户',s.authenticatedUsers??0),")
     .replace('priorityRelay:document.getElementById(\'set-priority-relay\').value})', 'priorityRelay:document.getElementById(\'set-priority-relay\').value,statusRefreshSeconds:document.getElementById(\'set-status-refresh\').value,accessMode:document.getElementById(\'set-access-mode\').value,accessPubkeys:document.getElementById(\'set-access-pubkeys\').value})')
     .replace('已保存中继资料和优先中继', '已保存中继资料、优先中继、刷新间隔和访问控制')
     .replaceAll('保存资料和优先中继', '保存资料和运行设置')
     .replace('</head>', `${mobileTableStyle}</head>`)
-    .replace('</body>', `${adminRefreshScript}</body>`);
+    .replace('</body>', `${activeUsersScript}${adminRefreshScript}</body>`);
 }
 
 function renderHomeHtml() {
   return HOME_HTML.replace(
+    "metric('在线用户',s.clients)",
+    "metric('有效用户',s.clients)"
+  ).replace(
     '页面只在打开或手动刷新浏览器时读取一次状态，尽量节省 Cloudflare 免费额度。',
     '上游 Relay 列表会按后台设定的安全间隔自动更新，兼顾状态及时性与 Cloudflare 免费额度。'
   );
@@ -571,6 +578,25 @@ export class RelayHub {
     if (Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persist().catch(() => {});
   }
 
+  clientStatistics() {
+    const authenticatedPubkeys = new Set();
+    const activePubkeys = new Set();
+    let authorizedConnections = 0;
+    for (const client of this.clients.values()) {
+      for (const pubkey of client.authenticatedPubkeys) authenticatedPubkeys.add(pubkey);
+      if (!this.clientAccess(client).allowed) continue;
+      authorizedConnections++;
+      for (const pubkey of client.authenticatedPubkeys) activePubkeys.add(pubkey);
+    }
+    const restricted = this.settings.accessMode !== "all";
+    return {
+      connectedClients: this.clients.size,
+      authenticatedUsers: authenticatedPubkeys.size,
+      effectiveUsers: restricted ? activePubkeys.size : authorizedConnections,
+      activeUsers: [...activePubkeys].sort()
+    };
+  }
+
   async fetch(request) {
     try {
       return await this.handleFetch(request);
@@ -582,6 +608,7 @@ export class RelayHub {
   async handleFetch(request) {
     await this.load();
     const url = new URL(request.url);
+    const clientStats = this.clientStatistics();
     const clientSubscriptions = [...this.clients.values()].reduce((n, c) => n + c.subscriptions.size, 0);
     const upstreamSubscriptions = [...this.upstreams.values()].reduce((n, u) => n + u.routes.size, 0);
     const upstreamCounts = [...this.upstreams.values()].reduce((n, u) => n + (u.countRoutes?.size || 0), 0);
@@ -590,7 +617,10 @@ export class RelayHub {
     if (url.pathname === "/status") return json({
       stats: this.stats,
       settings: this.settings,
-      clients: this.clients.size,
+      clients: clientStats.effectiveUsers,
+      connectedClients: clientStats.connectedClients,
+      authenticatedUsers: clientStats.authenticatedUsers,
+      activeUsers: clientStats.activeUsers,
       subscriptions: clientSubscriptions,
       clientSubscriptions,
       upstreamSubscriptions,
@@ -603,7 +633,7 @@ export class RelayHub {
       name: this.settings.name,
       settings: publicStatusSettings(this.settings),
       online: this.relays.some(r => r.connected),
-      clients: this.clients.size,
+      clients: clientStats.effectiveUsers,
       subscriptions: clientSubscriptions,
       clientSubscriptions,
       upstreamSubscriptions,
