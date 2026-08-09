@@ -33,8 +33,7 @@ function relayState(url, extra = {}) {
 // to upstream relays but are not features implemented by this relay itself.
 const DEFAULT_SUPPORTED_NIPS = [1, 11, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
-const DEFAULT_MAX_COUNT_RELAYS = 2;
-const DEFAULT_MAX_SUBSCRIPTION_RELAYS = 2;
+const DEFAULT_MAX_SECONDARY_RELAYS = 2;
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 5;
 const PUBLIC_STATUS_CACHE_SECONDS = 60;
@@ -279,6 +278,7 @@ function defaultSettings(env = {}) {
     icon: typeof env.RELAY_ICON === "string" ? env.RELAY_ICON : "",
     software: "https://github.com/zhoupingxiao/nostr-relay-proxy",
     version: "1.0.0",
+    priorityRelay: "",
     supported_nips: DEFAULT_SUPPORTED_NIPS
   };
 }
@@ -302,6 +302,7 @@ function normalizeSettings(input, env) {
     icon: String(input?.icon || "").trim(),
     software: String(input?.software || base.software).trim() || base.software,
     version: String(input?.version || base.version).trim() || base.version,
+    priorityRelay: isRelayUrl(normalizeRelayUrl(input?.priorityRelay)) ? normalizeRelayUrl(input?.priorityRelay) : "",
     supported_nips: DEFAULT_SUPPORTED_NIPS
   };
 }
@@ -563,6 +564,8 @@ export class RelayHub {
     if (url.pathname === "/settings" && request.method === "POST") {
       const body = await request.json().catch(() => ({}));
       this.settings = normalizeSettings(body, this.env);
+      if (this.settings.priorityRelay && !this.relays.some(relay => relay.url === this.settings.priorityRelay))
+        this.settings.priorityRelay = "";
       await this.persist();
       return json(this.settings);
     }
@@ -590,6 +593,7 @@ export class RelayHub {
       if (u?.ws) try { u.ws.close(1000, "removed"); } catch {}
       this.upstreams.delete(relay);
       this.relays = this.relays.filter(r => r.url !== relay);
+      if (this.settings.priorityRelay === relay) this.settings.priorityRelay = "";
       await this.persist();
       return json(this.relays);
     }
@@ -663,8 +667,7 @@ export class RelayHub {
       this.stats.events++;
       this.stats.forwarded++;
       let ok = false;
-      for (const u of this.upstreams.values()) {
-        if (!u.ws || u.ws.readyState !== WebSocket.OPEN) continue;
+      for (const u of this.writeUpstreams()) {
         const payload = JSON.stringify(["EVENT", event]);
         try {
           u.ws.send(payload);
@@ -687,7 +690,7 @@ export class RelayHub {
       const filters = msg.slice(2);
       if (!this.validSubscriptionRequest(subId, filters))
         return this.send(c, ["CLOSED", subId, "rate-limited: subscription request is too large"]);
-      const open = this.preferredUpstreams().slice(0, DEFAULT_MAX_COUNT_RELAYS);
+      const open = this.preferredUpstreams();
       if (!open.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
       const state = { filters, upstreamIds: new Map(), pending: 0, count: 0, approximate: open.length > 1, hll: "", responded: false, closedReason: "", timer: null };
       c.counts.set(subId, state);
@@ -719,9 +722,8 @@ export class RelayHub {
       // quickly leak subscriptions until an upstream starts rate-limiting.
       this.closeSubscription(c, subId);
       c.subscriptions.set(subId, { filters, upstreamIds: new Map() });
-      // Limit a subscription to the fastest two available upstreams. This
-      // keeps redundancy while preventing every client REQ from multiplying
-      // across a large relay list.
+      // Always include the configured priority relay, then use at most two
+      // low-latency upstreams for redundancy without querying the full list.
       for (const u of this.preferredUpstreams()) this.routeSubscription(c, subId, u);
       return;
     }
@@ -777,13 +779,30 @@ export class RelayHub {
   }
 
   preferredUpstreams() {
-    return this.openUpstreams()
+    const open = this.openUpstreams();
+    const priority = open.find(upstream => upstream.url === this.settings.priorityRelay);
+    const secondary = open
+      .filter(upstream => upstream !== priority)
       .sort((left, right) => {
         const a = this.relays.find(relay => relay.url === left.url)?.latencyMs;
         const b = this.relays.find(relay => relay.url === right.url)?.latencyMs;
         return (Number.isFinite(a) ? a : Number.MAX_SAFE_INTEGER) - (Number.isFinite(b) ? b : Number.MAX_SAFE_INTEGER);
       })
-      .slice(0, DEFAULT_MAX_SUBSCRIPTION_RELAYS);
+      .slice(0, DEFAULT_MAX_SECONDARY_RELAYS);
+    return priority ? [priority, ...secondary] : secondary;
+  }
+
+  writeUpstreams() {
+    const priority = this.settings.priorityRelay;
+    return this.openUpstreams().sort((left, right) => {
+      if (left.url === priority) return -1;
+      if (right.url === priority) return 1;
+      return 0;
+    });
+  }
+
+  maxSubscriptionRelayCount() {
+    return this.settings.priorityRelay ? DEFAULT_MAX_SECONDARY_RELAYS + 1 : DEFAULT_MAX_SECONDARY_RELAYS;
   }
 
   validSubscriptionRequest(subId, filters) {
@@ -794,7 +813,7 @@ export class RelayHub {
 
   routeSubscription(c, subId, u) {
     const sub = c.subscriptions.get(subId);
-    if (!sub || sub.upstreamIds.has(u.url) || sub.upstreamIds.size >= DEFAULT_MAX_SUBSCRIPTION_RELAYS) return;
+    if (!sub || sub.upstreamIds.has(u.url) || sub.upstreamIds.size >= this.maxSubscriptionRelayCount()) return;
     const upstreamId = `${c.id}:${subId}:${crypto.randomUUID().slice(0, 8)}`;
     sub.upstreamIds.set(u.url, upstreamId);
     u.routes.set(upstreamId, { clientId: c.id, subId });
@@ -891,7 +910,7 @@ export class RelayHub {
       this.persist().catch(() => {});
       for (const c of this.clients.values()) {
         for (const [subId, sub] of c.subscriptions) {
-          if (sub.upstreamIds.size >= DEFAULT_MAX_SUBSCRIPTION_RELAYS) continue;
+          if (sub.upstreamIds.size >= this.maxSubscriptionRelayCount()) continue;
           if (this.preferredUpstreams().some(candidate => candidate.url === url))
             this.routeSubscription(c, subId, u);
         }
@@ -1072,6 +1091,6 @@ refresh();</script></body></html>`;
 
 const LOGIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell"><div class="panel login"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy</div><h1>欢迎回来</h1><p class="muted">登录后管理上游 Relay 与实时网络状态。</p><form id="form"><input class="input" id="username" autocomplete="username" placeholder="管理员用户名" required><input class="input" id="password" type="password" autocomplete="current-password" placeholder="密码" required><button class="button primary" id="submit">安全登录</button><div class="notice" id="notice">__ERROR__</div></form></div></main><script>document.getElementById('form').onsubmit=async e=>{e.preventDefault();const b=document.getElementById('submit');b.disabled=true;b.textContent='登录中…';const user=document.getElementById('username').value;const pass=document.getElementById('password').value;const r=await fetch('/admin/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:user,password:pass})});if(r.ok){location.href='/admin';return}const d=await r.json().catch(()=>({error:'登录失败'}));const n=document.getElementById('notice');n.textContent=d.error||'登录失败';n.style.display='block';b.disabled=false;b.textContent='安全登录'}</script></body></html>`;
 
-const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell admin-shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero admin-hero"><div class="eyebrow">Control center</div><h1>Relay 网络控制台</h1><p class="lead">打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。</p></section><div class="grid" id="metrics"></div><section class="admin-grid relay-admin-grid" style="margin-top:18px"><div class="panel section relay-panel"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>延迟</th><th>连接时长</th><th>转发</th><th>下载</th><th>上传</th><th>下载量</th><th>重连</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><hr style="border:0;border-top:1px solid #28445f;margin:22px 0"><h2>中继资料</h2><div class="form-row" style="flex-direction:column"><input class="input" id="set-name" placeholder="中继名称"><input class="input" id="set-desc" placeholder="描述"><input class="input" id="set-pubkey" placeholder="机主公钥 hex"><input class="input" id="set-contact" placeholder="联系方式，例如 mailto:you@example.com"><input class="input" id="set-icon" placeholder="头像 URL"><div class="muted">支持的 NIPs（由程序自动声明）：01、11、45、77</div><button class="button primary" id="save-settings">保存资料</button></div><div class="notice" id="settings-notice"></div><div class="muted" style="margin-top:20px">提示：上游列表和中继资料都保存在 Durable Object；Cloudflare 中的变量仅用于首次默认值。</div></aside></section></main><script>
-const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'小时 '+m+'分';if(m)return m+'分 '+(s%60)+'秒';return s+'秒'};const size=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':(n||0)+' B';const api=async(p,o)=>{const r=await fetch(p,o);if(r.status===401){location.href='/admin';throw Error('unauthorized')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'请求失败');return d};let settingsLoaded=false;function card(label,value){let e=document.createElement('div');e.className='metric panel';e.innerHTML='<div class="value"></div><div class="label"></div>';e.children[0].textContent=value;e.children[1].textContent=label;return e}function show(msg){const n=document.getElementById('notice');n.textContent=msg;n.style.display=msg?'block':'none'}function showSettings(msg,ok=true){const n=document.getElementById('settings-notice');n.textContent=msg;n.style.display=msg?'block':'none';n.style.color=ok?'#7ef0bd':'#ffb5c3'}function normalizeRelayUrl(v){v=v.trim();if(!v)return '';const lower=v.toLowerCase();if(lower.startsWith('wss://'))return 'wss://'+v.slice(6);if(lower.startsWith('ws://'))return 'ws://'+v.slice(5);if(v.includes('://'))return v;return 'wss://'+v}function fillSettings(s,force=false){if(!s||!force&&settingsLoaded&&document.activeElement?.id?.startsWith('set-'))return;settingsLoaded=true;document.getElementById('set-name').value=s.name||'';document.getElementById('set-desc').value=s.description||'';document.getElementById('set-pubkey').value=s.pubkey||'';document.getElementById('set-contact').value=s.contact||'';document.getElementById('set-icon').value=s.icon||''}
-async function refresh(){try{const s=await api('/admin/api/status');document.getElementById('metrics').replaceChildren(card('在线用户',s.clients),card('客户端活跃订阅',s.clientSubscriptions??s.subscriptions),card('上游活跃订阅',s.upstreamSubscriptions??0),card('上传流量',size(s.stats.uploadedBytes)),card('下载流量',size(s.stats.downloadedBytes)),card('客户端事件',s.stats.events),card('可用上游',s.relays.filter(x=>x.connected).length+' / '+s.relays.length));fillSettings(s.settings);document.getElementById('uptime').textContent=elapsed(s.stats.startedAt);const tbody=document.getElementById('relays');tbody.replaceChildren(...s.relays.map(r=>{const tr=document.createElement('tr');const values=[r.url,r.connected?'在线':r.enabled?'离线':'已停用',r.latencyMs!==null&&r.latencyMs!==undefined?r.latencyMs+' ms':'—',r.connected?elapsed(r.lastConnectedAt):'—',r.forwardedEvents||0,r.downloadedEvents||0,size(r.uploadedBytes),size(r.downloadedBytes),r.reconnects||0,r.lastError||'—'];values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===1)td.className=r.connected?'badge on':'badge off';tr.append(td)});const actions=document.createElement('td');const toggle=document.createElement('button');toggle.className='button mini';toggle.textContent=r.enabled?'停用':'启用';toggle.onclick=()=>change('/admin/api/relays/toggle',{url:r.url,enabled:!r.enabled});const del=document.createElement('button');del.className='button danger mini';del.style.marginLeft='6px';del.textContent='删除';del.onclick=()=>{if(confirm('删除 '+r.url+'？'))change('/admin/api/relays',{url:r.url},'DELETE')};actions.append(toggle,del);tr.append(actions);return tr}));show('')}catch(e){show(e.message)}}async function change(path,body,method='POST'){try{await api(path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});refresh()}catch(e){show(e.message)}}async function saveSettings(){const b=document.getElementById('save-settings');b.disabled=true;b.textContent='保存中…';showSettings('正在保存…');try{const saved=await api('/admin/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:document.getElementById('set-name').value,description:document.getElementById('set-desc').value,pubkey:document.getElementById('set-pubkey').value,contact:document.getElementById('set-contact').value,icon:document.getElementById('set-icon').value})});fillSettings(saved,true);showSettings('已保存中继资料');setTimeout(()=>showSettings(''),2200)}catch(e){showSettings(e.message||'保存失败',false)}finally{b.disabled=false;b.textContent='保存资料'}}document.getElementById('add').onclick=()=>{const url=normalizeRelayUrl(document.getElementById('url').value);if(url){change('/admin/api/relays',{url});document.getElementById('url').value=''}};document.getElementById('save-settings').onclick=saveSettings;document.getElementById('url').addEventListener('blur',e=>{e.target.value=normalizeRelayUrl(e.target.value)});document.getElementById('ws').textContent=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('ws').textContent);document.getElementById('copy').textContent='已复制'};document.getElementById('logout').onclick=async()=>{await fetch('/admin/api/logout',{method:'POST'});location.href='/admin'};refresh();</script></body></html>`;
+const ADMIN_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理后台 · Nostr Relay Proxy</title><style>${BASE_STYLE}</style></head><body><main class="shell admin-shell"><nav class="nav"><div class="brand"><span class="mark">ϟ</span>Nostr Relay Proxy <span class="badge on">管理后台</span></div><div class="actions" style="margin:0"><a class="button" href="/">查看前台</a><button class="button" id="logout">退出</button></div></nav><section class="hero admin-hero"><div class="eyebrow">Control center</div><h1>Relay 网络控制台</h1><p class="lead">打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。</p></section><div class="grid" id="metrics"></div><section class="admin-grid relay-admin-grid" style="margin-top:18px"><div class="panel section relay-panel"><h2>上游 Relay</h2><p class="muted">启用后立即连接；停用不会删除配置。</p><div class="form-row"><input class="input" id="url" placeholder="relay.example.com" aria-label="Relay 地址"><button class="button primary" id="add">添加 Relay</button></div><div class="notice" id="notice"></div><div class="table-wrap"><table class="table"><thead><tr><th>地址</th><th>状态</th><th>延迟</th><th>连接时长</th><th>转发</th><th>下载</th><th>上传</th><th>下载量</th><th>重连</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="relays"></tbody></table></div></div><aside class="panel section"><h2>连接信息</h2><p class="muted">将以下地址填入 Nostr 客户端。</p><div class="relay-name" id="ws"></div><button class="copy" id="copy" style="margin-top:10px">复制 WebSocket 地址</button><hr style="border:0;border-top:1px solid #28445f;margin:24px 0"><div class="muted">服务运行时间</div><div class="value" style="font-size:25px;margin-top:6px" id="uptime">—</div><hr style="border:0;border-top:1px solid #28445f;margin:22px 0"><h2>中继资料</h2><div class="form-row" style="flex-direction:column"><input class="input" id="set-name" placeholder="中继名称"><input class="input" id="set-desc" placeholder="描述"><input class="input" id="set-pubkey" placeholder="机主公钥 hex"><input class="input" id="set-contact" placeholder="联系方式，例如 mailto:you@example.com"><input class="input" id="set-icon" placeholder="头像 URL"><div class="muted">支持的 NIPs（由程序自动声明）：01、11、45、77</div><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>优先中继</h2><p class="muted" style="margin:0">读取始终经过它，再选延迟最低的两个；发布会优先发送给它并继续发送到其他在线上游。</p><select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><button class="button primary" id="save-settings">保存资料和优先中继</button></div><div class="notice" id="settings-notice"></div><div class="muted" style="margin-top:20px">提示：上游列表、中继资料和优先中继都保存在 Durable Object；Cloudflare 中的变量仅用于首次默认值。</div></aside></section></main><script>
+const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'小时 '+m+'分';if(m)return m+'分 '+(s%60)+'秒';return s+'秒'};const size=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':(n||0)+' B';const api=async(p,o)=>{const r=await fetch(p,o);if(r.status===401){location.href='/admin';throw Error('unauthorized')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'请求失败');return d};let settingsLoaded=false;function card(label,value){let e=document.createElement('div');e.className='metric panel';e.innerHTML='<div class="value"></div><div class="label"></div>';e.children[0].textContent=value;e.children[1].textContent=label;return e}function show(msg){const n=document.getElementById('notice');n.textContent=msg;n.style.display=msg?'block':'none'}function showSettings(msg,ok=true){const n=document.getElementById('settings-notice');n.textContent=msg;n.style.display=msg?'block':'none';n.style.color=ok?'#7ef0bd':'#ffb5c3'}function normalizeRelayUrl(v){v=v.trim();if(!v)return '';const lower=v.toLowerCase();if(lower.startsWith('wss://'))return 'wss://'+v.slice(6);if(lower.startsWith('ws://'))return 'ws://'+v.slice(5);if(v.includes('://'))return v;return 'wss://'+v}function fillSettings(s,force=false){if(!s||!force&&settingsLoaded&&document.activeElement?.id?.startsWith('set-'))return;settingsLoaded=true;document.getElementById('set-name').value=s.name||'';document.getElementById('set-desc').value=s.description||'';document.getElementById('set-pubkey').value=s.pubkey||'';document.getElementById('set-contact').value=s.contact||'';document.getElementById('set-icon').value=s.icon||''}function fillPriorityRelay(s,relays){const select=document.getElementById('set-priority-relay');const current=s?.priorityRelay||'';select.replaceChildren(new Option('不设置（仅按延迟）',''));for(const relay of relays||[]){const option=new Option(relay.url,relay.url);if(!relay.enabled)option.textContent+='（已停用）';select.append(option)}select.value=current}
+async function refresh(){try{const s=await api('/admin/api/status');document.getElementById('metrics').replaceChildren(card('在线用户',s.clients),card('客户端活跃订阅',s.clientSubscriptions??s.subscriptions),card('上游活跃订阅',s.upstreamSubscriptions??0),card('上传流量',size(s.stats.uploadedBytes)),card('下载流量',size(s.stats.downloadedBytes)),card('客户端事件',s.stats.events),card('可用上游',s.relays.filter(x=>x.connected).length+' / '+s.relays.length));fillSettings(s.settings);fillPriorityRelay(s.settings,s.relays);document.getElementById('uptime').textContent=elapsed(s.stats.startedAt);const tbody=document.getElementById('relays');tbody.replaceChildren(...s.relays.map(r=>{const tr=document.createElement('tr');const values=[r.url,r.connected?'在线':r.enabled?'离线':'已停用',r.latencyMs!==null&&r.latencyMs!==undefined?r.latencyMs+' ms':'—',r.connected?elapsed(r.lastConnectedAt):'—',r.forwardedEvents||0,r.downloadedEvents||0,size(r.uploadedBytes),size(r.downloadedBytes),r.reconnects||0,r.lastError||'—'];values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(i===1)td.className=r.connected?'badge on':'badge off';tr.append(td)});const actions=document.createElement('td');const toggle=document.createElement('button');toggle.className='button mini';toggle.textContent=r.enabled?'停用':'启用';toggle.onclick=()=>change('/admin/api/relays/toggle',{url:r.url,enabled:!r.enabled});const del=document.createElement('button');del.className='button danger mini';del.style.marginLeft='6px';del.textContent='删除';del.onclick=()=>{if(confirm('删除 '+r.url+'？'))change('/admin/api/relays',{url:r.url},'DELETE')};actions.append(toggle,del);tr.append(actions);return tr}));show('')}catch(e){show(e.message)}}async function change(path,body,method='POST'){try{await api(path,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});refresh()}catch(e){show(e.message)}}async function saveSettings(){const b=document.getElementById('save-settings');b.disabled=true;b.textContent='保存中…';showSettings('正在保存…');try{const saved=await api('/admin/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:document.getElementById('set-name').value,description:document.getElementById('set-desc').value,pubkey:document.getElementById('set-pubkey').value,contact:document.getElementById('set-contact').value,icon:document.getElementById('set-icon').value,priorityRelay:document.getElementById('set-priority-relay').value})});fillSettings(saved,true);showSettings('已保存中继资料和优先中继');setTimeout(()=>showSettings(''),2200)}catch(e){showSettings(e.message||'保存失败',false)}finally{b.disabled=false;b.textContent='保存资料和优先中继'}}document.getElementById('add').onclick=()=>{const url=normalizeRelayUrl(document.getElementById('url').value);if(url){change('/admin/api/relays',{url});document.getElementById('url').value=''}};document.getElementById('save-settings').onclick=saveSettings;document.getElementById('url').addEventListener('blur',e=>{e.target.value=normalizeRelayUrl(e.target.value)});document.getElementById('ws').textContent=location.origin.replace(/^http/,'ws')+'/';document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('ws').textContent);document.getElementById('copy').textContent='已复制'};document.getElementById('logout').onclick=async()=>{await fetch('/admin/api/logout',{method:'POST'});location.href='/admin'};refresh();</script></body></html>`;

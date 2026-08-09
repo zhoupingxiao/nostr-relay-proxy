@@ -5,7 +5,7 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 ## 功能
 
 - WebSocket Nostr Relay：EVENT / REQ / CLOSE / COUNT / NEG-OPEN / NEG-MSG / NEG-CLOSE
-- 多上游 Relay 聚合：发布和订阅均覆盖全部在线上游；相同 Event ID 只向客户端发送一次
+- 多上游 Relay 聚合：发布覆盖全部在线上游；读取可设置优先 Relay，并额外查询两个低延迟上游
 - EOSE 聚合
 - 上游自动重连
 - NIP-11 Relay 信息，并由程序自动声明支持的 Relay NIPs：01、11、45、77
@@ -74,6 +74,8 @@ npx wrangler dev
 
 `UPSTREAM_RELAYS` 仅用于初始化一个全新的 Durable Object。初始化完成后，上游列表保存在 Durable Object Storage 中，请在 `/admin` 增删或启停。之后即使修改 Dashboard 中的 `UPSTREAM_RELAYS`，也不会覆盖已有列表。
 
+后台可选择一个“优先中继”。设置后，所有发布会优先发送到该中继，读取和 `COUNT` 会始终经过它，并额外选择两个延迟最低的在线上游；优先中继离线时自动回退到两个低延迟上游，恢复后自动加入。
+
 ## 订阅统计口径
 
 - `客户端活跃订阅`：当前客户端连接发起并仍未关闭的 `REQ` 数量。
@@ -86,8 +88,8 @@ npx wrangler dev
 代码内置以下保护，优先降低 Durable Objects 请求：
 
 - 流量与连接统计最多约每 30 秒写入一次 Durable Object Storage。
-- 客户端发起 NIP-45 `COUNT` 时最多转发到 2 个在线上游，避免大量上游同时放大查询。
-- 普通 `REQ` 每个订阅最多查询 2 个延迟较低的在线上游；其他上游仍用于发布与故障切换。这样会降低对第三个及以后上游独有历史事件的覆盖率。
+- 客户端发起 NIP-45 `COUNT` 时优先转发到优先中继，再加最多 2 个低延迟上游，避免大量上游同时放大查询。
+- 普通 `REQ` 每个订阅优先查询优先中继，再加最多 2 个延迟较低的在线上游；其他上游仍用于发布与故障切换。这样会降低对第三个及以后上游独有历史事件的覆盖率。
 - 每个客户端最多 24 个活跃订阅、每个订阅最多 5 个 filter；超出时返回 `rate-limited`。
 - 新建 WebSocket 连接会按 IP 限制为每分钟 12 次，在请求进入 Durable Object 前拒绝异常重连或扫描流量。
 - 公开状态缓存 60 秒，NIP-11 资料缓存 5 分钟；保存中继资料或修改上游时会立即清除缓存。
