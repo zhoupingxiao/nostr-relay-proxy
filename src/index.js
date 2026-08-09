@@ -33,7 +33,12 @@ function relayState(url, extra = {}) {
 // to upstream relays but are not features implemented by this relay itself.
 const DEFAULT_SUPPORTED_NIPS = [1, 11, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
-const DEFAULT_MAX_COUNT_RELAYS = 5;
+const DEFAULT_MAX_COUNT_RELAYS = 2;
+const DEFAULT_MAX_SUBSCRIPTION_RELAYS = 2;
+const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
+const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 5;
+const PUBLIC_STATUS_CACHE_SECONDS = 60;
+const NIP11_CACHE_SECONDS = 300;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 function normalizeRelayUrl(value) {
@@ -117,6 +122,46 @@ function nip11Headers(extra = {}) {
     "cache-control": "no-store",
     ...extra
   };
+}
+
+function publicCacheKey(url, name) {
+  const key = new URL(url.origin);
+  key.pathname = `/_relay-cache/${name}`;
+  return new Request(key.toString());
+}
+
+async function cachedRelayResponse(request, env, upstreamPath, cacheName, seconds) {
+  const cache = caches.default;
+  const key = publicCacheKey(new URL(request.url), cacheName);
+  const cached = await cache.match(key);
+  if (cached) return cached;
+  const id = env.RELAY.idFromName("global");
+  const upstream = await env.RELAY.get(id).fetch(`https://relay${upstreamPath}`);
+  const headers = new Headers(upstream.headers);
+  headers.set("cache-control", `public, max-age=${seconds}, s-maxage=${seconds}`);
+  const response = new Response(upstream.body, { status: upstream.status, headers });
+  await cache.put(key, response.clone());
+  return response;
+}
+
+async function clearPublicRelayCache(request) {
+  const cache = caches.default;
+  const url = new URL(request.url);
+  await Promise.all([
+    cache.delete(publicCacheKey(url, "status")),
+    cache.delete(publicCacheKey(url, "nip11"))
+  ]);
+}
+
+async function allowWebSocketConnection(request, env) {
+  if (!env.CONNECTION_LIMIT) return true;
+  const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("x-forwarded-for") || "unknown";
+  try {
+    return (await env.CONNECTION_LIMIT.limit({ key: ip })).success;
+  } catch {
+    // A rate-limiter availability issue must not take the relay offline.
+    return true;
+  }
 }
 
 async function authOk(request, env) {
@@ -292,12 +337,13 @@ export default {
       // Nostr clients connect to the root URL with a WebSocket upgrade. This
       // must be handled before returning the human-facing homepage.
       if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+        if (!await allowWebSocketConnection(request, env))
+          return new Response("Too many new WebSocket connections; please retry shortly.", { status: 429 });
         const id = env.RELAY.idFromName("global");
         return env.RELAY.get(id).fetch(request);
       }
       if (request.headers.get("accept")?.includes("application/nostr+json")) {
-        const id = env.RELAY.idFromName("global");
-        return env.RELAY.get(id).fetch("https://relay/nip11");
+        return cachedRelayResponse(request, env, "/nip11", "nip11", NIP11_CACHE_SECONDS);
       }
       if (request.headers.get("accept")?.includes("application/json")) {
         return json({ name: "nostr-relay-proxy", websocket: relayUrl(request), status: `${url.origin}/status`, admin: `${url.origin}/admin` });
@@ -306,13 +352,11 @@ export default {
     }
 
     if (url.pathname === "/status") {
-      const id = env.RELAY.idFromName("global");
-      return env.RELAY.get(id).fetch("https://relay/public-status");
+      return cachedRelayResponse(request, env, "/public-status", "status", PUBLIC_STATUS_CACHE_SECONDS);
     }
 
     if (url.pathname === "/nip11") {
-      const id = env.RELAY.idFromName("global");
-      return env.RELAY.get(id).fetch("https://relay/nip11");
+      return cachedRelayResponse(request, env, "/nip11", "nip11", NIP11_CACHE_SECONDS);
     }
 
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
@@ -348,41 +392,51 @@ export default {
         return stub.fetch("https://relay/settings");
 
       if (request.method === "POST" && url.pathname === "/admin/api/settings") {
-        return stub.fetch(new Request("https://relay/settings", {
+        const response = await stub.fetch(new Request("https://relay/settings", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
         }));
+        if (response.ok) await clearPublicRelayCache(request);
+        return response;
       }
 
       if (request.method === "POST" && url.pathname === "/admin/api/relays") {
-        return stub.fetch(new Request("https://relay/relays", {
+        const response = await stub.fetch(new Request("https://relay/relays", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
         }));
+        if (response.ok) await clearPublicRelayCache(request);
+        return response;
       }
 
       if (request.method === "DELETE" && url.pathname === "/admin/api/relays") {
-        return stub.fetch(new Request("https://relay/relays", {
+        const response = await stub.fetch(new Request("https://relay/relays", {
           method: "DELETE",
           headers: { "content-type": "application/json" },
           body: await request.text()
         }));
+        if (response.ok) await clearPublicRelayCache(request);
+        return response;
       }
 
       if (request.method === "POST" && url.pathname === "/admin/api/relays/toggle") {
-        return stub.fetch(new Request("https://relay/relays/toggle", {
+        const response = await stub.fetch(new Request("https://relay/relays/toggle", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
         }));
+        if (response.ok) await clearPublicRelayCache(request);
+        return response;
       }
 
       return json({ error: "not found" }, 404);
     }
 
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      if (!await allowWebSocketConnection(request, env))
+        return new Response("Too many new WebSocket connections; please retry shortly.", { status: 429 });
       const id = env.RELAY.idFromName("global");
       return env.RELAY.get(id).fetch(request);
     }
@@ -631,8 +685,9 @@ export class RelayHub {
     if (type === "COUNT") {
       const subId = String(msg[1] || "");
       const filters = msg.slice(2);
-      if (!subId || !filters.length) return;
-      const open = this.openUpstreams().slice(0, DEFAULT_MAX_COUNT_RELAYS);
+      if (!this.validSubscriptionRequest(subId, filters))
+        return this.send(c, ["CLOSED", subId, "rate-limited: subscription request is too large"]);
+      const open = this.preferredUpstreams().slice(0, DEFAULT_MAX_COUNT_RELAYS);
       if (!open.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
       const state = { filters, upstreamIds: new Map(), pending: 0, count: 0, approximate: open.length > 1, hll: "", responded: false, closedReason: "", timer: null };
       c.counts.set(subId, state);
@@ -655,21 +710,19 @@ export class RelayHub {
     if (type === "REQ") {
       const subId = String(msg[1] || "");
       const filters = msg.slice(2);
-      if (!subId || !filters.length) return;
+      if (!this.validSubscriptionRequest(subId, filters))
+        return this.send(c, ["CLOSED", subId, "rate-limited: subscription request is too large"]);
+      if (!c.subscriptions.has(subId) && c.subscriptions.size >= DEFAULT_MAX_CLIENT_SUBSCRIPTIONS)
+        return this.send(c, ["CLOSED", subId, "rate-limited: too many active subscriptions"]);
       // NIP-01 uses the subscription id as the replacement key.  Without
       // closing its previous upstream routes, clients that refresh filters
       // quickly leak subscriptions until an upstream starts rate-limiting.
       this.closeSubscription(c, subId);
       c.subscriptions.set(subId, { filters, upstreamIds: new Map() });
-      // Query every online upstream so that events unique to a particular
-      // relay still reach the client.  Incoming EVENT messages are deduped by
-      // event id below, so duplicates are sent to the client only once.
-      for (const u of this.openUpstreams()) {
-        const upstreamId = `${clientId}:${subId}:${crypto.randomUUID().slice(0, 8)}`;
-        c.subscriptions.get(subId).upstreamIds.set(u.url, upstreamId);
-        u.routes.set(upstreamId, { clientId, subId });
-        try { u.ws.send(JSON.stringify(["REQ", upstreamId, ...filters])); } catch {}
-      }
+      // Limit a subscription to the fastest two available upstreams. This
+      // keeps redundancy while preventing every client REQ from multiplying
+      // across a large relay list.
+      for (const u of this.preferredUpstreams()) this.routeSubscription(c, subId, u);
       return;
     }
 
@@ -721,6 +774,34 @@ export class RelayHub {
 
   openUpstreams() {
     return [...this.upstreams.values()].filter(u => u.ws && u.ws.readyState === WebSocket.OPEN);
+  }
+
+  preferredUpstreams() {
+    return this.openUpstreams()
+      .sort((left, right) => {
+        const a = this.relays.find(relay => relay.url === left.url)?.latencyMs;
+        const b = this.relays.find(relay => relay.url === right.url)?.latencyMs;
+        return (Number.isFinite(a) ? a : Number.MAX_SAFE_INTEGER) - (Number.isFinite(b) ? b : Number.MAX_SAFE_INTEGER);
+      })
+      .slice(0, DEFAULT_MAX_SUBSCRIPTION_RELAYS);
+  }
+
+  validSubscriptionRequest(subId, filters) {
+    return subId.length > 0 && subId.length <= 64 &&
+      filters.length > 0 && filters.length <= DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION &&
+      filters.every(filter => filter && typeof filter === "object" && !Array.isArray(filter));
+  }
+
+  routeSubscription(c, subId, u) {
+    const sub = c.subscriptions.get(subId);
+    if (!sub || sub.upstreamIds.has(u.url) || sub.upstreamIds.size >= DEFAULT_MAX_SUBSCRIPTION_RELAYS) return;
+    const upstreamId = `${c.id}:${subId}:${crypto.randomUUID().slice(0, 8)}`;
+    sub.upstreamIds.set(u.url, upstreamId);
+    u.routes.set(upstreamId, { clientId: c.id, subId });
+    try { u.ws.send(JSON.stringify(["REQ", upstreamId, ...sub.filters])); } catch {
+      sub.upstreamIds.delete(u.url);
+      u.routes.delete(upstreamId);
+    }
   }
 
   closeSubscription(c, subId) {
@@ -810,10 +891,9 @@ export class RelayHub {
       this.persist().catch(() => {});
       for (const c of this.clients.values()) {
         for (const [subId, sub] of c.subscriptions) {
-          const upstreamId = `${c.id}:${subId}:${crypto.randomUUID().slice(0, 8)}`;
-          sub.upstreamIds.set(url, upstreamId);
-          u.routes.set(upstreamId, { clientId: c.id, subId });
-          try { ws.send(JSON.stringify(["REQ", upstreamId, ...sub.filters])); } catch {}
+          if (sub.upstreamIds.size >= DEFAULT_MAX_SUBSCRIPTION_RELAYS) continue;
+          if (this.preferredUpstreams().some(candidate => candidate.url === url))
+            this.routeSubscription(c, subId, u);
         }
       }
     });
@@ -825,6 +905,15 @@ export class RelayHub {
     });
     ws.addEventListener("close", () => {
       item.connected = false;
+      const affectedSubscriptions = [];
+      for (const [upstreamId, route] of u.routes) {
+        const c = this.clients.get(route.clientId);
+        const sub = c?.subscriptions.get(route.subId);
+        if (sub?.upstreamIds.get(url) === upstreamId) {
+          sub.upstreamIds.delete(url);
+          affectedSubscriptions.push([c, route.subId]);
+        }
+      }
       for (const route of [...u.countRoutes.values()]) {
         const c = this.clients.get(route.clientId);
         const count = c?.counts.get(route.subId);
@@ -843,6 +932,9 @@ export class RelayHub {
         }
       }
       this.upstreams.delete(url);
+      for (const [c, subId] of affectedSubscriptions) {
+        for (const candidate of this.preferredUpstreams()) this.routeSubscription(c, subId, candidate);
+      }
       this.stats.reconnects++;
       item.reconnects = (item.reconnects || 0) + 1;
       this.persist().catch(() => {});
