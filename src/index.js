@@ -298,9 +298,14 @@ function accessMode(value) {
   return ["all", "whitelist", "blacklist"].includes(value) ? value : "all";
 }
 
+function accessPubkeyInputs(value) {
+  return (Array.isArray(value) ? value : String(value || "").split(/[\s,;]+/))
+    .map(item => String(item || "").trim())
+    .filter(Boolean);
+}
+
 function accessPubkeys(value) {
-  const values = Array.isArray(value) ? value : String(value || "").split(/[\s,;]+/);
-  return [...new Set(values.map(decodeNpub).filter(Boolean))].slice(0, 500);
+  return [...new Set(accessPubkeyInputs(value).map(decodeNpub).filter(Boolean))].slice(0, 500);
 }
 
 function relayHost(value) {
@@ -350,18 +355,19 @@ function adminPage() {
 }
 
 function renderAdminHtml() {
-  const mobileTableStyle = `<style>.relay-panel .table th:first-child,.relay-panel .table td:first-child{width:1%;min-width:0!important;white-space:nowrap}@media(max-width:720px){.relay-panel,.relay-panel .table-wrap{min-width:0}.relay-panel .table-wrap{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}.relay-panel .table{display:table;width:max-content;min-width:100%}.relay-panel .table thead{display:table-header-group}.relay-panel .table tbody{display:table-row-group}.relay-panel .table tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.relay-panel .table th,.relay-panel .table td{display:table-cell;width:1%;min-width:auto!important;white-space:nowrap!important;padding:8px 7px;border-bottom:1px solid #222b37;text-align:left;word-break:normal}.relay-panel .table td::before{display:none}}</style>`;
+  const mobileTableStyle = `<style>@media(min-width:901px){.relay-admin-grid{grid-template-columns:minmax(0,2fr) minmax(420px,1fr)}}.relay-panel .table th:first-child,.relay-panel .table td:first-child{width:1%;min-width:0!important;white-space:nowrap}@media(max-width:720px){.relay-panel,.relay-panel .table-wrap{min-width:0}.relay-panel .table-wrap{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}.relay-panel .table{display:table;width:max-content;min-width:100%}.relay-panel .table thead{display:table-header-group}.relay-panel .table tbody{display:table-row-group}.relay-panel .table tr{display:table-row;margin:0;padding:0;border:0;background:transparent}.relay-panel .table th,.relay-panel .table td{display:table-cell;width:1%;min-width:auto!important;white-space:nowrap!important;padding:8px 7px;border-bottom:1px solid #222b37;text-align:left;word-break:normal}.relay-panel .table td::before{display:none}}</style>`;
   const refreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join('\n'))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
+  const adminRefreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join(String.fromCharCode(10)))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
   return ADMIN_HTML
     .replace('打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。', '上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。')
     .replace('支持的 NIPs（由程序自动声明）：01、11、45、77', '支持的 NIPs（由程序自动声明）：01、11、42、45、77')
     .replace('<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><button class="button primary" id="save-settings">保存资料和优先中继</button>', '<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><label class="muted" for="set-status-refresh">上游列表刷新间隔（秒，最低 60）</label><input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>')
-    .replace('<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>', '<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>访问控制</h2><p class="muted" style="margin:0">白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行填入一个用户公钥（hex 或 npub）。</p><select class="input" id="set-access-mode"><option value="all">全部：所有用户可使用</option><option value="whitelist">白名单：仅列表内用户</option><option value="blacklist">黑名单：拒绝列表内用户</option></select><textarea class="input" id="set-access-pubkeys" rows="6" placeholder="npub1… 或 64 位 hex 公钥，每行一个"></textarea><button class="button primary" id="save-settings">保存资料和运行设置</button>')
+    .replace('<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>', '<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>访问控制</h2><p class="muted" style="margin:0">白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行填入一个用户公钥（hex 或 npub）。</p><select class="input" id="set-access-mode"><option value="all">全部</option><option value="whitelist">白名单</option><option value="blacklist">黑名单</option></select><textarea class="input" id="set-access-pubkeys" rows="8" wrap="off" style="min-width:0;white-space:pre;overflow-x:auto" placeholder="npub1… 或 64 位 hex 公钥，每行一个"></textarea><button class="button primary" id="save-settings">保存资料和运行设置</button>')
     .replace('priorityRelay:document.getElementById(\'set-priority-relay\').value})', 'priorityRelay:document.getElementById(\'set-priority-relay\').value,statusRefreshSeconds:document.getElementById(\'set-status-refresh\').value,accessMode:document.getElementById(\'set-access-mode\').value,accessPubkeys:document.getElementById(\'set-access-pubkeys\').value})')
     .replace('已保存中继资料和优先中继', '已保存中继资料、优先中继、刷新间隔和访问控制')
     .replaceAll('保存资料和优先中继', '保存资料和运行设置')
     .replace('</head>', `${mobileTableStyle}</head>`)
-    .replace('</body>', `${refreshScript}</body>`);
+    .replace('</body>', `${adminRefreshScript}</body>`);
 }
 
 function renderHomeHtml() {
@@ -612,6 +618,9 @@ export class RelayHub {
 
     if (url.pathname === "/settings" && request.method === "POST") {
       const body = await request.json().catch(() => ({}));
+      const invalidAccessPubkeys = accessPubkeyInputs(body.accessPubkeys).filter(pubkey => !decodeNpub(pubkey));
+      if (invalidAccessPubkeys.length)
+        return json({ error: "invalid access public key", message: "每行必须是完整的 npub 或 64 位十六进制公钥" }, 400);
       this.settings = normalizeSettings(body, this.env);
       if (this.settings.priorityRelay && !this.relays.some(relay => relay.url === this.settings.priorityRelay))
         this.settings.priorityRelay = "";
