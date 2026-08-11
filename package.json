@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --keep-vars"
+    "deploy": "wrangler deploy --keep-vars",
+    "test": "node --test"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

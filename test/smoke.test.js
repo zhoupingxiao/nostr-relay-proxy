@@ -1,0 +1,70 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import worker, { RelayHub } from "../src/index.js";
+
+function mockState(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  const writes = [];
+  return {
+    writes,
+    storage: {
+      async get(key) { return values.get(key); },
+      async put(key, value) { writes.push(key); values.set(key, value); }
+    }
+  };
+}
+
+test("health endpoint is available without Durable Object bindings", async () => {
+  const response = await worker.fetch(new Request("https://relay.example/health"), {});
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.service, "nostr-relay-proxy");
+  assert.equal(typeof body.time, "number");
+});
+
+test("missing admin variables fail closed with an actionable response", async () => {
+  const response = await worker.fetch(new Request("https://relay.example/admin/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "password" })
+  }), {});
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /ADMIN_USER/);
+});
+
+test("RelayHub persists settings and normalizes access users", async () => {
+  const state = mockState();
+  const hub = new RelayHub(state, {});
+  const response = await hub.fetch(new Request("https://relay/settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "Test relay",
+      accessMode: "whitelist",
+      accessUsers: [`${"a".repeat(64)} | Alice`]
+    })
+  }));
+  assert.equal(response.status, 200);
+  const settings = await response.json();
+  assert.equal(settings.name, "Test relay");
+  assert.equal(settings.accessMode, "whitelist");
+  assert.deepEqual(settings.accessUsers, [{ pubkey: "a".repeat(64), name: "Alice" }]);
+  assert.ok(state.writes.includes("settings"));
+});
+
+test("REQ without an available upstream is closed immediately", async () => {
+  const state = mockState();
+  const hub = new RelayHub(state, {});
+  await hub.load();
+  const sent = [];
+  hub.clients.set("client", {
+    id: "client",
+    ws: { send(value) { sent.push(JSON.parse(value)); } },
+    subscriptions: new Map(), counts: new Map(), negentropy: new Map(), seen: new Map(),
+    authenticatedPubkeys: new Set(), authChallenge: "challenge", authChallengeSent: false,
+    relayHost: "relay.example", createdAt: Date.now()
+  });
+  await hub.onClientMessage("client", JSON.stringify(["REQ", "sub", { kinds: [1] }]));
+  assert.deepEqual(sent, [["CLOSED", "sub", "error: no upstream relay available"]]);
+});

@@ -41,7 +41,14 @@ const DEFAULT_MAX_SECONDARY_RELAYS = 2;
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 20;
 const DEFAULT_MAX_SUBSCRIPTION_BYTES = 48 * 1024;
+const DEFAULT_MAX_CLIENT_MESSAGE_BYTES = 256 * 1024;
+const DEFAULT_MAX_UPSTREAM_MESSAGE_BYTES = 512 * 1024;
+const DEFAULT_MAX_AUTH_ATTEMPTS = 8;
+const DEFAULT_AUTH_WINDOW_MS = 60 * 1000;
+const DEFAULT_EOSE_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 15 * 60 * 1000;
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 15000;
+const DEFAULT_UPSTREAM_START_STAGGER_MS = 250;
 const PUBLIC_STATUS_CACHE_SECONDS = 60;
 const NIP11_CACHE_SECONDS = 300;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -118,6 +125,12 @@ function errorMessage(error) {
   return error?.message ? String(error.message) : String(error || "unknown error");
 }
 
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, character => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  }[character]));
+}
+
 function nip11Headers(extra = {}) {
   return {
     "content-type": "application/nostr+json; charset=utf-8",
@@ -145,7 +158,7 @@ async function cachedRelayResponse(request, env, upstreamPath, cacheName, second
   const headers = new Headers(upstream.headers);
   headers.set("cache-control", `public, max-age=${seconds}, s-maxage=${seconds}`);
   const response = new Response(upstream.body, { status: upstream.status, headers });
-  await cache.put(key, response.clone());
+  if (response.ok) await cache.put(key, response.clone());
   return response;
 }
 
@@ -224,7 +237,7 @@ async function verifySession(token, username, password) {
 }
 
 function loginPage(error = "") {
-  return new Response(LOGIN_HTML.replace("<div class=\"panel login\">", `<div class="panel login"><div style="display:flex;justify-content:flex-end">${LANGUAGE_CONTROL}</div>`).replace("__ERROR__", error).replace("</body>", `${localizationScript()}</body>`), { headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(LOGIN_HTML.replace("<div class=\"panel login\">", `<div class="panel login"><div style="display:flex;justify-content:flex-end">${LANGUAGE_CONTROL}</div>`).replace("__ERROR__", escapeHtml(error)).replace("</body>", `${localizationScript()}</body>`), { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 function sessionCookie(request, value, maxAge) {
@@ -337,7 +350,7 @@ function relayHost(value) {
   try { return new URL(value).host.toLowerCase(); } catch { return ""; }
 }
 
-  function reconnectDelayMs(current = 1000) {
+function reconnectDelayMs(current = 1000) {
   const next = Math.min(DEFAULT_MAX_RECONNECT_DELAY_MS, Math.max(1000, Number(current) * 2));
   return Math.max(1000, Math.round(next * (0.8 + Math.random() * 0.4)));
 }
@@ -463,6 +476,7 @@ function renderAdminHtml() {
   const adminRefreshScript = `<script>(()=>{let timer;const input=()=>document.getElementById('set-status-refresh');const seconds=()=>Math.min(900,Math.max(60,Number(input()?.value)||60));const schedule=()=>{clearTimeout(timer);timer=setTimeout(async()=>{await refresh();schedule()},seconds()*1000)};const setIfIdle=(id,value)=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.value=value};const sync=()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(input()&&settings&&document.activeElement!==input()){input().value=settings.statusRefreshSeconds||60;schedule()}if(settings){setIfIdle('set-access-mode',settings.accessMode||'all');setIfIdle('set-access-pubkeys',(settings.accessPubkeys||[]).join(String.fromCharCode(10)))}};const priority=window.fillPriorityRelay;window.fillPriorityRelay=(...args)=>{if(document.activeElement?.id==='set-priority-relay')return;priority(...args)};setTimeout(schedule,50)};sync();document.getElementById('save-settings').addEventListener('click',()=>setTimeout(schedule,2500));})()</script>`;
   const activeUsersScript = `<script>(()=>{window.renderAccessUsers=status=>{const list=document.getElementById('active-users');const detail=document.getElementById('active-users-detail');if(!list||!detail)return;const mode=status.settings?.accessMode||'all';const users=status.activeUsers||[];if(mode==='all'){detail.textContent='全部模式按在线连接计数；客户端未认证时无法识别其公钥。';list.replaceChildren();return}detail.textContent='当前 '+users.length+' 个已认证且通过规则的用户；已认证公钥总数 '+(status.authenticatedUsers??0)+'。';list.replaceChildren(...users.map(pubkey=>{const row=document.createElement('div');row.className='relay';const name=document.createElement('div');name.className='relay-name';name.textContent=pubkey.slice(0,16)+'…'+pubkey.slice(-10);name.title=pubkey;const copy=document.createElement('button');copy.className='copy';copy.textContent='复制';copy.onclick=async()=>{await navigator.clipboard.writeText(pubkey);copy.textContent='已复制'};row.append(name,copy);return row}));if(!users.length)list.innerHTML='<div class="muted">暂无有效用户</div>'}})()</script>`;
   const activeUsersNamesScript = `<script>(()=>{window.renderAccessUsers=status=>{const list=document.getElementById('active-users');const detail=document.getElementById('active-users-detail');if(!list||!detail)return;const mode=status.settings?.accessMode||'all';const users=status.activeUsers||[];if(mode==='all'){detail.textContent='全部模式按在线连接计数；客户端未认证时无法识别其公钥。';list.replaceChildren();return}detail.textContent='当前 '+users.length+' 个已认证且通过规则的用户；已认证公钥总数 '+(status.authenticatedUsers??0)+'。';list.replaceChildren(...users.map(user=>{const pubkey=user.pubkey||'';const row=document.createElement('div');row.className='relay';const name=document.createElement('div');name.className='relay-name';name.textContent=(user.name?user.name+' · ':'')+pubkey.slice(0,16)+'…'+pubkey.slice(-10);name.title=pubkey;const copy=document.createElement('button');copy.className='copy';copy.textContent='复制';copy.onclick=async()=>{await navigator.clipboard.writeText(pubkey);copy.textContent='已复制'};row.append(name,copy);return row}));if(!users.length)list.innerHTML='<div class="muted">暂无有效用户</div>'}})()</script>`;
+  const adminVisibilityScript = `<script>(()=>{const original=window.refresh;if(typeof original!=='function')return;window.refresh=async(...args)=>{if(document.hidden)return null;return original(...args)};document.addEventListener('visibilitychange',()=>{if(!document.hidden)window.refresh?.()})})()</script>`;
   const namedAccessSettingsScript = `<script>(()=>{const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);const el=document.getElementById('set-access-users');if(el&&settings&&document.activeElement!==el)el.value=(settings.accessUsers||[]).map(user=>user.pubkey+(user.name?' | '+user.name:'')).join(String.fromCharCode(10))}})()</script>`;
   const accessUsersFormScript = `<script>(()=>{const root=()=>document.getElementById('set-access-users');const add=(user={})=>{const container=root();if(!container)return;const row=document.createElement('div');row.className='access-user-row';const pubkey=document.createElement('input');pubkey.className='input';pubkey.dataset.field='pubkey';pubkey.placeholder='公钥（npub 或 hex）';pubkey.value=user.pubkey||'';const name=document.createElement('input');name.className='input';name.dataset.field='name';name.placeholder='用户名';name.value=user.name||'';const remove=document.createElement('button');remove.type='button';remove.className='button danger mini';remove.textContent='删除';remove.onclick=()=>row.remove();row.append(pubkey,name,remove);container.append(row)};window.renderAccessUsersForm=users=>{const container=root();if(!container||document.activeElement?.closest('.access-user-row'))return;container.replaceChildren();for(const user of users||[])add(user);if(!container.children.length)add()};window.collectAccessUsers=()=>[...root()?.querySelectorAll('.access-user-row')||[]].map(row=>{const pubkey=row.querySelector('[data-field=pubkey]')?.value.trim()||'';const name=row.querySelector('[data-field=name]')?.value.trim()||'';return pubkey?(pubkey+(name?' | '+name:'')):''}).filter(Boolean).join(String.fromCharCode(10));document.getElementById('add-access-user')?.addEventListener('click',()=>add()) ;const saved=window.fillSettings;window.fillSettings=(settings,...args)=>{saved(settings,...args);if(settings)window.renderAccessUsersForm(settings.accessUsers||[])}})()</script>`;
   const safeAdminRefreshScript = adminRefreshScript.replaceAll('set-access-pubkeys', 'set-access-users').replaceAll('accessPubkeys||[]).join(String.fromCharCode(10))', "accessUsers||[]).map(user=>user.pubkey+(user.name?' | '+user.name:'')).join(String.fromCharCode(10))");
@@ -489,7 +503,7 @@ function renderAdminHtml() {
     .replaceAll('保存资料和优先中继', '保存资料和运行设置')
     .replace('</head>', `${mobileTableStyle}</head>`)
     .replace('<a class="button" href="/">查看前台</a>', `${LANGUAGE_CONTROL}<a class="button" href="/">查看前台</a>`)
-    .replace('</body>', `${activeUsersScript}${activeUsersNamesScript}${accessUsersFormScript}${namedAccessSettingsScript}${safeAdminRefreshScript}${localizationScript()}</body>`);
+    .replace('</body>', `${activeUsersScript}${activeUsersNamesScript}${accessUsersFormScript}${namedAccessSettingsScript}${safeAdminRefreshScript}${adminVisibilityScript}${localizationScript()}</body>`);
 }
 
 function renderHomeHtml() {
@@ -647,13 +661,23 @@ export class RelayHub {
     };
     this.lastPersistAt = 0;
     this.persistInFlight = null;
+    this.persistStatsInFlight = null;
+    this.persistRelaysInFlight = null;
+    this.reconnectTimers = new Map();
+    this.alarmAt = null;
+    this.accessSettingsRef = null;
+    this.accessPubkeySet = new Set();
     this.loaded = false;
   }
 
   async load() {
     if (this.loaded) return;
-    this.relays = (await this.state.storage.get("relays") || configuredRelays(this.env))
-      .map(r => relayState(r.url, r));
+    const storedRelays = await this.state.storage.get("relays");
+    const sourceRelays = Array.isArray(storedRelays) ? storedRelays : configuredRelays(this.env);
+    const seenRelays = new Set();
+    this.relays = sourceRelays
+      .map(r => relayState(normalizeRelayUrl(r?.url), r))
+      .filter(relay => isRelayUrl(relay.url) && !seenRelays.has(relay.url) && seenRelays.add(relay.url));
     this.settings = normalizeSettings(await this.state.storage.get("settings"), this.env);
     this.stats = { ...this.stats, ...(await this.state.storage.get("stats") || {}) };
     // These were shown by an older dashboard but are not useful operational
@@ -665,7 +689,13 @@ export class RelayHub {
       await this.state.storage.put("stats", this.stats);
     }
     this.loaded = true;
-    for (const r of this.relays.filter(x => x.enabled)) this.connectUpstream(r.url);
+    const now = Date.now();
+    this.relays.filter(x => x.enabled).forEach((relay, index) => {
+      if (Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt > now) return;
+      const delay = Math.min(index * DEFAULT_UPSTREAM_START_STAGGER_MS, 10000) + Math.round(Math.random() * 150);
+      setTimeout(() => this.connectUpstream(relay.url), delay);
+    });
+    this.scheduleAlarm();
   }
 
   persist() {
@@ -679,6 +709,54 @@ export class RelayHub {
       this.persistInFlight = null;
     });
     return this.persistInFlight;
+  }
+
+  persistStats() {
+    if (this.persistStatsInFlight) return this.persistStatsInFlight;
+    this.persistStatsInFlight = this.state.storage.put("stats", this.stats)
+      .then(() => { this.lastPersistAt = Date.now(); })
+      .finally(() => { this.persistStatsInFlight = null; });
+    return this.persistStatsInFlight;
+  }
+
+  persistTraffic() {
+    if (this.persistStatsInFlight) return this.persistStatsInFlight;
+    this.persistStatsInFlight = (async () => {
+      await this.state.storage.put("stats", this.stats);
+      await this.state.storage.put("relays", this.relays);
+      this.lastPersistAt = Date.now();
+    })().finally(() => { this.persistStatsInFlight = null; });
+    return this.persistStatsInFlight;
+  }
+
+  persistRelays() {
+    if (this.persistRelaysInFlight) return this.persistRelaysInFlight;
+    this.persistRelaysInFlight = this.state.storage.put("relays", this.relays)
+      .finally(() => { this.persistRelaysInFlight = null; });
+    return this.persistRelaysInFlight;
+  }
+
+  scheduleAlarm() {
+    const next = this.relays
+      .filter(relay => relay.enabled && Number.isFinite(relay.nextReconnectAt))
+      .reduce((time, relay) => Math.min(time, relay.nextReconnectAt), Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(next) || !this.state.storage.setAlarm) return;
+    if (this.alarmAt && this.alarmAt <= next) return;
+    this.alarmAt = next;
+    Promise.resolve().then(() => this.state.storage.setAlarm(next)).catch(() => { this.alarmAt = null; });
+  }
+
+  async alarm() {
+    this.alarmAt = null;
+    await this.load();
+    const now = Date.now();
+    for (const relay of this.relays) {
+      if (relay.enabled && Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt <= now) {
+        relay.nextReconnectAt = null;
+        this.connectUpstream(relay.url);
+      }
+    }
+    this.scheduleAlarm();
   }
 
   recordTraffic(direction, source, raw, msg) {
@@ -696,12 +774,16 @@ export class RelayHub {
         if (entry.type === "EVENT") relay.downloadedEvents = (relay.downloadedEvents || 0) + 1;
       }
     }
-    if (Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persist().catch(() => {});
+    if (Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
   }
 
   ensureRuntimeSettings() {
     if (!this.settings || !["all", "whitelist", "blacklist"].includes(this.settings.accessMode) || !Array.isArray(this.settings.accessPubkeys) || !Array.isArray(this.settings.accessUsers))
       this.settings = normalizeSettings(this.settings, this.env);
+    if (this.settings !== this.accessSettingsRef) {
+      this.accessSettingsRef = this.settings;
+      this.accessPubkeySet = new Set(this.settings.accessPubkeys);
+    }
   }
 
   ensureClientState(client) {
@@ -710,6 +792,13 @@ export class RelayHub {
     if (!(client.negentropy instanceof Map)) client.negentropy = new Map();
     if (!(client.seen instanceof Map)) client.seen = new Map();
     if (!(client.authenticatedPubkeys instanceof Set)) client.authenticatedPubkeys = new Set();
+    if (!Array.isArray(client.authAttempts)) client.authAttempts = [];
+    for (const sub of client.subscriptions.values()) {
+      if (!(sub.upstreamIds instanceof Map)) sub.upstreamIds = new Map();
+      if (!(sub.eoseUrls instanceof Set)) sub.eoseUrls = new Set();
+      if (typeof sub.eoseSent !== "boolean") sub.eoseSent = false;
+      if (!("eoseTimer" in sub)) sub.eoseTimer = null;
+    }
     if (!client.authChallenge) client.authChallenge = crypto.randomUUID();
     if (!client.relayHost) client.relayHost = "";
     if (typeof client.authChallengeSent !== "boolean") client.authChallengeSent = false;
@@ -842,9 +931,10 @@ export class RelayHub {
     if (url.pathname === "/relays" && request.method === "DELETE") {
       const body = await request.json();
       const relay = String(body.url || "");
-      const u = this.upstreams.get(relay);
-      if (u?.ws) try { u.ws.close(1000, "removed"); } catch {}
-      this.upstreams.delete(relay);
+      this.cancelReconnect(relay);
+      const item = this.relays.find(r => r.url === relay);
+      if (item) item.enabled = false;
+      this.stopUpstream(relay, "removed");
       this.relays = this.relays.filter(r => r.url !== relay);
       if (this.settings.priorityRelay === relay) this.settings.priorityRelay = "";
       await this.persist();
@@ -858,9 +948,8 @@ export class RelayHub {
       item.enabled = body.enabled !== false;
       if (item.enabled) this.connectUpstream(item.url);
       else {
-        const u = this.upstreams.get(item.url);
-        if (u?.ws) try { u.ws.close(1000, "disabled"); } catch {}
-        this.upstreams.delete(item.url);
+        this.cancelReconnect(item.url);
+        this.stopUpstream(item.url, "disabled");
       }
       await this.persist();
       return json(this.relays);
@@ -924,6 +1013,10 @@ export class RelayHub {
     const c = this.clients.get(clientId);
     if (!c || typeof raw !== "string") return;
     this.ensureClientState(c);
+    if (byteLength(raw) > DEFAULT_MAX_CLIENT_MESSAGE_BYTES) {
+      this.send(c, ["NOTICE", "rate-limited: message is too large"]);
+      return;
+    }
     let msg;
     try { msg = JSON.parse(raw); } catch {
       try { c.ws.send(JSON.stringify(["NOTICE", "invalid JSON"])); } catch {}
@@ -942,15 +1035,16 @@ export class RelayHub {
 
     if (type === "EVENT") {
       const event = msg[1];
-      if (!event?.id) return this.send(c, ["NOTICE", "invalid EVENT"]);
+      if (!event || typeof event !== "object" || typeof event.id !== "string" || !/^[0-9a-f]{64}$/i.test(event.id))
+        return this.send(c, ["NOTICE", "invalid EVENT"]);
       if (Array.isArray(event.tags) && event.tags.some(tag => Array.isArray(tag) && tag[0] === "-")) {
         return this.send(c, ["OK", event.id, false, "auth-required: protected events are not accepted by this proxy"]);
       }
       this.stats.events++;
       this.stats.forwarded++;
       let ok = false;
+      const payload = JSON.stringify(["EVENT", event]);
       for (const u of this.writeUpstreams()) {
-        const payload = JSON.stringify(["EVENT", event]);
         try {
           u.ws.send(payload);
           ok = true;
@@ -962,7 +1056,7 @@ export class RelayHub {
           }
         } catch {}
       }
-      if (ok && Date.now() - this.lastPersistAt > 10000) this.persist().catch(() => {});
+      if (ok && Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
       this.send(c, ["OK", event.id, ok, ok ? "forwarded" : "no upstream relay available"]);
       return;
     }
@@ -1003,10 +1097,14 @@ export class RelayHub {
       // closing its previous upstream routes, clients that refresh filters
       // quickly leak subscriptions until an upstream starts rate-limiting.
       this.closeSubscription(c, subId);
-      c.subscriptions.set(subId, { filters, upstreamIds: new Map() });
+      const upstreams = this.preferredUpstreams();
+      if (!upstreams.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
+      const sub = { filters, upstreamIds: new Map(), eoseUrls: new Set(), eoseSent: false, eoseTimer: null };
+      c.subscriptions.set(subId, sub);
       // Always include the configured priority relay, then use at most two
       // low-latency upstreams for redundancy without querying the full list.
-      for (const u of this.preferredUpstreams()) this.routeSubscription(c, subId, u);
+      for (const u of upstreams) this.routeSubscription(c, subId, u);
+      sub.eoseTimer = setTimeout(() => this.sendEoseIfReady(c, subId, true), DEFAULT_EOSE_TIMEOUT_MS);
       return;
     }
 
@@ -1058,6 +1156,11 @@ export class RelayHub {
 
   authenticateClient(c, event) {
     this.ensureClientState(c);
+    const now = Date.now();
+    c.authAttempts = c.authAttempts.filter(at => now - at < DEFAULT_AUTH_WINDOW_MS);
+    if (c.authAttempts.length >= DEFAULT_MAX_AUTH_ATTEMPTS)
+      return this.send(c, ["OK", String(event?.id || ""), false, "rate-limited: too many authentication attempts"]);
+    c.authAttempts.push(now);
     const eventId = typeof event?.id === "string" ? event.id : "";
     const fail = reason => this.send(c, ["OK", eventId, false, reason]);
     if (!event || event.kind !== 22242 || !/^[0-9a-f]{64}$/i.test(event.pubkey || ""))
@@ -1070,6 +1173,7 @@ export class RelayHub {
       return fail("invalid: authentication challenge or relay does not match");
     if (!verifyEvent(event)) return fail("invalid: authentication signature is invalid");
     c.authenticatedPubkeys.add(event.pubkey.toLowerCase());
+    c.authAttempts = [];
     this.send(c, ["OK", eventId, true, "authenticated"]);
   }
 
@@ -1080,7 +1184,7 @@ export class RelayHub {
     if (mode === "all") return { allowed: true };
     if (!c.authenticatedPubkeys.size)
       return { allowed: false, reason: "auth-required: authenticate with NIP-42 to use this relay" };
-    const listed = this.settings.accessPubkeys.some(pubkey => c.authenticatedPubkeys.has(pubkey));
+    const listed = [...c.authenticatedPubkeys].some(pubkey => this.accessPubkeySet.has(pubkey));
     if (mode === "whitelist" && !listed)
       return { allowed: false, reason: "restricted: this pubkey is not on the relay whitelist" };
     if (mode === "blacklist" && listed)
@@ -1097,6 +1201,16 @@ export class RelayHub {
     return this.send(c, ["NOTICE", reason]);
   }
 
+  sendEoseIfReady(c, subId, force = false) {
+    const sub = c?.subscriptions.get(subId);
+    if (!sub || sub.eoseSent) return;
+    if (!force && sub.upstreamIds.size > 0 && sub.eoseUrls.size < sub.upstreamIds.size) return;
+    if (sub.eoseTimer) clearTimeout(sub.eoseTimer);
+    sub.eoseTimer = null;
+    sub.eoseSent = true;
+    this.send(c, ["EOSE", subId]);
+  }
+
   openUpstreams() {
     return [...this.upstreams.values()].filter(u => u.ws && u.ws.readyState === WebSocket.OPEN);
   }
@@ -1104,11 +1218,12 @@ export class RelayHub {
   preferredUpstreams() {
     const open = this.openUpstreams();
     const priority = open.find(upstream => upstream.url === this.settings.priorityRelay);
+    const latencyByUrl = new Map(this.relays.map(relay => [relay.url, relay.latencyMs]));
     const secondary = open
       .filter(upstream => upstream !== priority)
       .sort((left, right) => {
-        const a = this.relays.find(relay => relay.url === left.url)?.latencyMs;
-        const b = this.relays.find(relay => relay.url === right.url)?.latencyMs;
+        const a = latencyByUrl.get(left.url);
+        const b = latencyByUrl.get(right.url);
         return (Number.isFinite(a) ? a : Number.MAX_SAFE_INTEGER) - (Number.isFinite(b) ? b : Number.MAX_SAFE_INTEGER);
       })
       .slice(0, DEFAULT_MAX_SECONDARY_RELAYS);
@@ -1150,6 +1265,7 @@ export class RelayHub {
   closeSubscription(c, subId) {
     const sub = c.subscriptions.get(subId);
     if (!sub) return;
+    if (sub.eoseTimer) clearTimeout(sub.eoseTimer);
     for (const [url, upstreamId] of sub.upstreamIds) {
       const u = this.upstreams.get(url);
       if (!u) continue;
@@ -1201,7 +1317,95 @@ export class RelayHub {
     c.counts.delete(subId);
   }
 
+  cancelReconnect(url) {
+    const timer = this.reconnectTimers.get(url);
+    if (timer) clearTimeout(timer);
+    this.reconnectTimers.delete(url);
+    const item = this.relays.find(relay => relay.url === url);
+    if (item) item.nextReconnectAt = null;
+    this.scheduleAlarm();
+  }
+
+  scheduleReconnect(url, delay) {
+    this.cancelReconnect(url);
+    const item = this.relays.find(relay => relay.url === url);
+    if (!item?.enabled) return;
+    item.nextReconnectAt = Date.now() + delay;
+    this.scheduleAlarm();
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(url);
+      this.connectUpstream(url);
+    }, delay);
+    this.reconnectTimers.set(url, timer);
+  }
+
+  stopUpstream(url, reason = "stopped") {
+    const u = this.upstreams.get(url);
+    if (!u) return;
+    u.manualClose = true;
+    try { u.ws?.close(1000, reason); } catch {}
+    if (u.ws?.readyState !== WebSocket.OPEN && !u.connecting)
+      this.handleUpstreamClose(url, u);
+  }
+
+  handleUpstreamClose(url, u) {
+    if (u.closed) return;
+    u.closed = true;
+    if (u.connectTimer) clearTimeout(u.connectTimer);
+    if (this.upstreams.get(url) !== u) return;
+    const item = this.relays.find(relay => relay.url === url);
+    if (item) item.connected = false;
+    const affectedSubscriptions = [];
+    for (const [upstreamId, route] of u.routes) {
+      const c = this.clients.get(route.clientId);
+      if (c) this.ensureClientState(c);
+      const sub = c?.subscriptions.get(route.subId);
+      if (sub?.upstreamIds.get(url) === upstreamId) {
+        sub.upstreamIds.delete(url);
+        sub.eoseUrls?.delete(url);
+        affectedSubscriptions.push([c, route.subId]);
+      }
+    }
+    for (const route of [...u.countRoutes.values()]) {
+      const c = this.clients.get(route.clientId);
+      if (c) this.ensureClientState(c);
+      const count = c?.counts.get(route.subId);
+      if (count) {
+        count.pending = Math.max(0, count.pending - 1);
+        count.approximate = true;
+        count.closedReason = "error: upstream relay disconnected";
+        if (count.pending === 0) this.finishCount(route.clientId, route.subId, true);
+      }
+    }
+    for (const route of [...u.negRoutes.values()]) {
+      const c = this.clients.get(route.clientId);
+      if (c) this.ensureClientState(c);
+      if (c) {
+        this.send(c, ["NEG-ERR", route.negId, "error: upstream relay disconnected"]);
+        c.negentropy.delete(route.negId);
+      }
+    }
+    this.upstreams.delete(url);
+    for (const [c, subId] of affectedSubscriptions) {
+      for (const candidate of this.preferredUpstreams()) this.routeSubscription(c, subId, candidate);
+    }
+    const reconnecting = !u.manualClose && item?.enabled;
+    if (reconnecting) {
+      this.stats.reconnects++;
+      item.reconnects = (item.reconnects || 0) + 1;
+      const stable = u.openedAt && Date.now() - u.openedAt >= 30000;
+      const delay = reconnectDelayMs(stable ? 1000 : (item.reconnectDelayMs || 1000));
+      item.reconnectDelayMs = delay;
+      this.scheduleReconnect(url, delay);
+      this.persistStats().catch(() => {});
+    } else if (item) {
+      item.nextReconnectAt = null;
+    }
+    this.persistRelays().catch(() => {});
+  }
+
   connectUpstream(url) {
+    this.cancelReconnect(url);
     const existing = this.upstreams.get(url);
     if (existing?.connecting || existing?.ws?.readyState === WebSocket.OPEN) return;
     const item = this.relays.find(r => r.url === url);
@@ -1216,19 +1420,25 @@ export class RelayHub {
       item.lastError = errorMessage(error);
       const delay = reconnectDelayMs(item.reconnectDelayMs || 1000);
       item.reconnectDelayMs = delay;
-      item.nextReconnectAt = Date.now() + delay;
-      this.persist().catch(() => {});
-      if (item.enabled) setTimeout(() => this.connectUpstream(url), delay);
+      this.persistRelays().catch(() => {});
+      this.scheduleReconnect(url, delay);
       return;
     }
     const u = {
       url, ws, routes: new Map(), countRoutes: new Map(), negRoutes: new Map(), connecting: true, reconnectTimer: null,
-      backoff: Math.min((existing?.backoff || 1000) * 2, 30000), openedAt: 0
+      backoff: Math.min((existing?.backoff || 1000) * 2, 30000), openedAt: 0, closed: false, manualClose: false, connectTimer: null
     };
     this.upstreams.set(url, u);
+    u.connectTimer = setTimeout(() => {
+      if (u.closed || this.upstreams.get(url) !== u || !u.connecting) return;
+      item.lastError = "upstream connection timed out";
+      try { ws.close(1000, "connect timeout"); } catch {}
+      this.handleUpstreamClose(url, u);
+    }, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS);
 
     ws.addEventListener("open", () => {
       u.connecting = false;
+      if (u.connectTimer) clearTimeout(u.connectTimer);
       u.backoff = 1000;
       u.openedAt = Date.now();
       item.nextReconnectAt = null;
@@ -1237,7 +1447,7 @@ export class RelayHub {
       item.latencyMs = Math.max(0, Date.now() - startedAt);
       item.lastLatencyAt = Date.now();
       item.lastError = null;
-      this.persist().catch(() => {});
+      this.persistRelays().catch(() => {});
       for (const c of this.clients.values()) {
         this.ensureClientState(c);
         for (const [subId, sub] of c.subscriptions) {
@@ -1254,57 +1464,16 @@ export class RelayHub {
     });
     ws.addEventListener("error", () => {
       item.lastError = "upstream websocket error";
-      this.persist().catch(() => {});
-    });
-    ws.addEventListener("close", () => {
-      item.connected = false;
-      const affectedSubscriptions = [];
-      for (const [upstreamId, route] of u.routes) {
-        const c = this.clients.get(route.clientId);
-        if (c) this.ensureClientState(c);
-        const sub = c?.subscriptions.get(route.subId);
-        if (sub?.upstreamIds.get(url) === upstreamId) {
-          sub.upstreamIds.delete(url);
-          affectedSubscriptions.push([c, route.subId]);
-        }
-      }
-      for (const route of [...u.countRoutes.values()]) {
-        const c = this.clients.get(route.clientId);
-        if (c) this.ensureClientState(c);
-        const count = c?.counts.get(route.subId);
-        if (count) {
-          count.pending = Math.max(0, count.pending - 1);
-          count.approximate = true;
-          count.closedReason = "error: upstream relay disconnected";
-          if (count.pending === 0) this.finishCount(route.clientId, route.subId, true);
-        }
-      }
-      for (const route of [...u.negRoutes.values()]) {
-        const c = this.clients.get(route.clientId);
-        if (c) this.ensureClientState(c);
-        if (c) {
-          this.send(c, ["NEG-ERR", route.negId, "error: upstream relay disconnected"]);
-          c.negentropy.delete(route.negId);
-        }
-      }
-      this.upstreams.delete(url);
-      for (const [c, subId] of affectedSubscriptions) {
-        for (const candidate of this.preferredUpstreams()) this.routeSubscription(c, subId, candidate);
-      }
-      this.stats.reconnects++;
-      item.reconnects = (item.reconnects || 0) + 1;
-      const stable = u.openedAt && Date.now() - u.openedAt >= 30000;
-      const delay = reconnectDelayMs(stable ? 1000 : (item.reconnectDelayMs || 1000));
-      item.reconnectDelayMs = delay;
-      item.nextReconnectAt = Date.now() + delay;
-      this.persist().catch(() => {});
-      if (item.enabled) {
-        try { setTimeout(() => this.connectUpstream(url), delay); } catch {}
+      this.persistRelays().catch(() => {});
+      if (u.connecting) {
+        try { ws.close(1011, "connection error"); } catch {}
       }
     });
+    ws.addEventListener("close", () => this.handleUpstreamClose(url, u));
   }
 
   onUpstreamMessage(url, raw) {
+    if (typeof raw !== "string" || byteLength(raw) > DEFAULT_MAX_UPSTREAM_MESSAGE_BYTES) return;
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     if (!Array.isArray(msg) || !msg[0]) return;
@@ -1391,7 +1560,10 @@ export class RelayHub {
     if (!c) return;
 
     if (msg[0] === "EOSE") {
-      this.send(c, ["EOSE", route.subId]);
+      const sub = c.subscriptions.get(route.subId);
+      if (!sub) return;
+      sub.eoseUrls.add(url);
+      this.sendEoseIfReady(c, route.subId);
       return;
     }
 
@@ -1403,6 +1575,7 @@ export class RelayHub {
       const sub = c.subscriptions.get(route.subId);
       if (sub?.upstreamIds.get(url) === upstreamId) sub.upstreamIds.delete(url);
       if (sub?.upstreamIds.size) return;
+      if (sub?.eoseTimer) clearTimeout(sub.eoseTimer);
       c.subscriptions.delete(route.subId);
       this.send(c, ["CLOSED", route.subId, ...msg.slice(2)]);
       return;
