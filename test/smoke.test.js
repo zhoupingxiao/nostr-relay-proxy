@@ -85,3 +85,32 @@ test("storage failures back off instead of retrying on every traffic message", a
   assert.equal(writes, 1);
   assert.ok(hub.persistRetryAt > Date.now());
 });
+
+test("NIP-11 remains available when Durable Object dispatch fails", async () => {
+  const env = {
+    RELAY: {
+      idFromName() { return "global"; },
+      get() { return { fetch() { throw new Error("DO overloaded"); } }; }
+    }
+  };
+  const response = await worker.fetch(new Request("https://relay.example/metadata", {
+    headers: { accept: "application/nostr+json" }
+  }), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-relay-degraded"), "1");
+  assert.deepEqual((await response.json()).supported_nips, [1, 11, 42, 45, 77]);
+});
+
+test("public status returns a degraded snapshot when Durable Object is down", async () => {
+  globalThis.caches = { default: { async match() { return undefined; }, async put() {} } };
+  const env = {
+    RELAY: {
+      idFromName() { return "global"; },
+      get() { return { fetch() { throw new Error("DO unavailable"); } }; }
+    }
+  };
+  const response = await worker.fetch(new Request("https://relay.example/status"), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-relay-degraded"), "1");
+  assert.equal((await response.json()).degraded, true);
+});

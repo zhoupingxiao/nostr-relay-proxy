@@ -56,7 +56,9 @@ const DEFAULT_CONNECT_QUEUE_RETRY_MS = 1000;
 const DEFAULT_UPSTREAM_START_STAGGER_MS = 750;
 const PUBLIC_STATUS_CACHE_SECONDS = 60;
 const NIP11_CACHE_SECONDS = 300;
+const DO_CIRCUIT_COOLDOWN_MS = 10000;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+let doCircuitOpenUntil = 0;
 
 function normalizeRelayUrl(value) {
   const raw = String(value || "").trim();
@@ -153,14 +155,48 @@ function publicCacheKey(url, name) {
   return new Request(key.toString());
 }
 
-async function durableFetch(env, request) {
+function unavailableResponse() {
+  return json({ error: "relay temporarily unavailable", message: "Durable Object is busy or unavailable; retry shortly" }, 503, { "retry-after": "10" });
+}
+
+async function durableFetch(env, request, fallback = null) {
+  if (Date.now() < doCircuitOpenUntil) return fallback ? fallback() : unavailableResponse();
   try {
     const id = env.RELAY.idFromName("global");
-    return await env.RELAY.get(id).fetch(request);
+    const response = await env.RELAY.get(id).fetch(request);
+    if (response.status >= 500) {
+      doCircuitOpenUntil = Date.now() + DO_CIRCUIT_COOLDOWN_MS;
+      return fallback ? fallback() : response;
+    }
+    doCircuitOpenUntil = 0;
+    return response;
   } catch (error) {
     console.error("Durable Object dispatch failed", error);
-    return json({ error: "relay temporarily unavailable", message: "Durable Object is busy or unavailable; retry shortly" }, 503, { "retry-after": "10" });
+    doCircuitOpenUntil = Date.now() + DO_CIRCUIT_COOLDOWN_MS;
+    return fallback ? fallback() : unavailableResponse();
   }
+}
+
+function fallbackNip11(env) {
+  return new Response(JSON.stringify(nip11Info(defaultSettings(env))), { headers: nip11Headers({ "x-relay-degraded": "1" }) });
+}
+
+function fallbackPublicStatus(env) {
+  const settings = defaultSettings(env);
+  return json({
+    name: settings.name,
+    settings: publicStatusSettings(settings),
+    online: false,
+    degraded: true,
+    clients: 0,
+    subscriptions: 0,
+    clientSubscriptions: 0,
+    upstreamSubscriptions: 0,
+    upstreamCounts: 0,
+    upstreamNegentropy: 0,
+    stats: { events: 0, forwarded: 0, deduped: 0, connections: 0, reconnects: 0, uploadedMessages: 0, downloadedMessages: 0, uploadedBytes: 0, downloadedBytes: 0 },
+    relays: []
+  }, 200, { "access-control-allow-origin": "*", "cache-control": "no-store", "x-relay-degraded": "1" });
 }
 
 async function cachedRelayResponse(request, env, upstreamPath, cacheName, seconds) {
@@ -168,11 +204,13 @@ async function cachedRelayResponse(request, env, upstreamPath, cacheName, second
   const key = publicCacheKey(new URL(request.url), cacheName);
   const cached = await cache.match(key);
   if (cached) return cached;
-  const upstream = await durableFetch(env, `https://relay${upstreamPath}`);
+  const fallback = cacheName === "nip11" ? () => fallbackNip11(env) : () => fallbackPublicStatus(env);
+  const upstream = await durableFetch(env, `https://relay${upstreamPath}`, fallback);
   const headers = new Headers(upstream.headers);
-  headers.set("cache-control", `public, max-age=${seconds}, s-maxage=${seconds}`);
+  if (upstream.headers.get("x-relay-degraded") === "1") headers.set("cache-control", "no-store");
+  else headers.set("cache-control", `public, max-age=${seconds}, s-maxage=${seconds}`);
   const response = new Response(upstream.body, { status: upstream.status, headers });
-  if (response.ok) await cache.put(key, response.clone());
+  if (response.ok && response.headers.get("x-relay-degraded") !== "1") await cache.put(key, response.clone());
   return response;
 }
 
@@ -644,12 +682,11 @@ export default {
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       if (!await allowWebSocketConnection(request, env))
         return new Response("Too many new WebSocket connections; please retry shortly.", { status: 429 });
-      const id = env.RELAY.idFromName("global");
-      return env.RELAY.get(id).fetch(request);
+      return durableFetch(env, request);
     }
 
     if (request.headers.get("accept")?.includes("application/nostr+json")) {
-      return durableFetch(env, "https://relay/nip11");
+      return durableFetch(env, "https://relay/nip11", () => fallbackNip11(env));
     }
 
     return json({ error: "not found" }, 404);
