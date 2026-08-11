@@ -23,6 +23,13 @@ test("health endpoint is available without Durable Object bindings", async () =>
   assert.equal(typeof body.time, "number");
 });
 
+test("homepage is available without Durable Object bindings and is never cached", async () => {
+  const response = await worker.fetch(new Request("https://relay.example/"), {});
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store, max-age=0");
+  assert.match(await response.text(), /renderUnavailable/);
+});
+
 test("missing admin variables fail closed with an actionable response", async () => {
   const response = await worker.fetch(new Request("https://relay.example/admin/api/login", {
     method: "POST",
