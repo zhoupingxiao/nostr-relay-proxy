@@ -16,6 +16,7 @@ Cloudflare Workers + Durable Objects 的多上游 Nostr Relay 聚合代理。
 - 访问控制：全部、白名单、黑名单（按 Nostr 公钥）
 - 在线客户端、客户端活跃订阅、上游活跃订阅、事件与流量统计
 - 可调的上游 Relay 列表刷新间隔（60–900 秒）
+- 前台、后台和登录页支持中文/English 切换，并记住浏览器选择
 - 不使用 D1/R2
 
 ## 部署到 Cloudflare
