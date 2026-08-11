@@ -47,8 +47,10 @@ const DEFAULT_MAX_AUTH_ATTEMPTS = 8;
 const DEFAULT_AUTH_WINDOW_MS = 60 * 1000;
 const DEFAULT_EOSE_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 15 * 60 * 1000;
-const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 15000;
-const DEFAULT_UPSTREAM_START_STAGGER_MS = 250;
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
+const DEFAULT_MAX_CONNECTING_UPSTREAMS = 8;
+const DEFAULT_CONNECT_QUEUE_RETRY_MS = 1000;
+const DEFAULT_UPSTREAM_START_STAGGER_MS = 750;
 const PUBLIC_STATUS_CACHE_SECONDS = 60;
 const NIP11_CACHE_SECONDS = 300;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -664,6 +666,7 @@ export class RelayHub {
     this.persistStatsInFlight = null;
     this.persistRelaysInFlight = null;
     this.reconnectTimers = new Map();
+    this.connectQueueTimers = new Map();
     this.alarmAt = null;
     this.accessSettingsRef = null;
     this.accessPubkeySet = new Set();
@@ -692,8 +695,8 @@ export class RelayHub {
     const now = Date.now();
     this.relays.filter(x => x.enabled).forEach((relay, index) => {
       if (Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt > now) return;
-      const delay = Math.min(index * DEFAULT_UPSTREAM_START_STAGGER_MS, 10000) + Math.round(Math.random() * 150);
-      setTimeout(() => this.connectUpstream(relay.url), delay);
+      const delay = Math.min(index * DEFAULT_UPSTREAM_START_STAGGER_MS, 30000) + Math.round(Math.random() * 250);
+      this.queueConnect(relay.url, delay);
     });
     this.scheduleAlarm();
   }
@@ -1321,6 +1324,9 @@ export class RelayHub {
     const timer = this.reconnectTimers.get(url);
     if (timer) clearTimeout(timer);
     this.reconnectTimers.delete(url);
+    const queued = this.connectQueueTimers.get(url);
+    if (queued) clearTimeout(queued);
+    this.connectQueueTimers.delete(url);
     const item = this.relays.find(relay => relay.url === url);
     if (item) item.nextReconnectAt = null;
     this.scheduleAlarm();
@@ -1337,6 +1343,17 @@ export class RelayHub {
       this.connectUpstream(url);
     }, delay);
     this.reconnectTimers.set(url, timer);
+  }
+
+  queueConnect(url, delay = DEFAULT_CONNECT_QUEUE_RETRY_MS) {
+    if (this.connectQueueTimers.has(url) || this.upstreams.has(url)) return;
+    const item = this.relays.find(relay => relay.url === url);
+    if (!item?.enabled) return;
+    const timer = setTimeout(() => {
+      this.connectQueueTimers.delete(url);
+      this.connectUpstream(url);
+    }, Math.max(0, delay));
+    this.connectQueueTimers.set(url, timer);
   }
 
   stopUpstream(url, reason = "stopped") {
@@ -1410,6 +1427,11 @@ export class RelayHub {
     if (existing?.connecting || existing?.ws?.readyState === WebSocket.OPEN) return;
     const item = this.relays.find(r => r.url === url);
     if (!item?.enabled) return;
+    const connecting = [...this.upstreams.values()].filter(upstream => upstream.connecting).length;
+    if (connecting >= DEFAULT_MAX_CONNECTING_UPSTREAMS) {
+      this.queueConnect(url);
+      return;
+    }
 
     const startedAt = Date.now();
     let ws;
@@ -1562,6 +1584,7 @@ export class RelayHub {
     if (msg[0] === "EOSE") {
       const sub = c.subscriptions.get(route.subId);
       if (!sub) return;
+      if (!(sub.eoseUrls instanceof Set)) sub.eoseUrls = new Set();
       sub.eoseUrls.add(url);
       this.sendEoseIfReady(c, route.subId);
       return;
