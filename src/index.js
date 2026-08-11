@@ -44,6 +44,8 @@ const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 20;
 const DEFAULT_MAX_SUBSCRIPTION_BYTES = 48 * 1024;
 const DEFAULT_MAX_CLIENT_MESSAGE_BYTES = 256 * 1024;
 const DEFAULT_MAX_UPSTREAM_MESSAGE_BYTES = 512 * 1024;
+const DEFAULT_MAX_CLIENTS = 200;
+const DEFAULT_MAX_CLIENT_MESSAGES_PER_MINUTE = 1200;
 const DEFAULT_MAX_AUTH_ATTEMPTS = 8;
 const DEFAULT_AUTH_WINDOW_MS = 60 * 1000;
 const DEFAULT_EOSE_TIMEOUT_MS = 2000;
@@ -815,6 +817,9 @@ export class RelayHub {
     }
     if (!client.authChallenge) client.authChallenge = crypto.randomUUID();
     if (!client.relayHost) client.relayHost = "";
+    if (!Number.isFinite(client.messageWindowStartedAt)) client.messageWindowStartedAt = Date.now();
+    if (!Number.isFinite(client.messageWindowCount)) client.messageWindowCount = 0;
+    if (!Number.isFinite(client.rateLimitNoticeAt)) client.rateLimitNoticeAt = 0;
     if (typeof client.authChallengeSent !== "boolean") client.authChallengeSent = false;
     return client;
   }
@@ -977,6 +982,8 @@ export class RelayHub {
   }
 
   acceptClient(request) {
+    if (this.clients.size >= DEFAULT_MAX_CLIENTS)
+      return new Response("Relay is busy; please retry shortly.", { status: 503, headers: { "retry-after": "10" } });
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -992,6 +999,9 @@ export class RelayHub {
       authChallenge: crypto.randomUUID(),
       authChallengeSent: false,
       relayHost: relayHost(request.url),
+      messageWindowStartedAt: Date.now(),
+      messageWindowCount: 0,
+      rateLimitNoticeAt: 0,
       createdAt: Date.now()
     };
     this.clients.set(clientId, state);
@@ -1027,6 +1037,20 @@ export class RelayHub {
     const c = this.clients.get(clientId);
     if (!c || typeof raw !== "string") return;
     this.ensureClientState(c);
+    const now = Date.now();
+    if (now - c.messageWindowStartedAt >= 60000) {
+      c.messageWindowStartedAt = now;
+      c.messageWindowCount = 0;
+      c.rateLimitNoticeAt = 0;
+    }
+    c.messageWindowCount++;
+    if (c.messageWindowCount > DEFAULT_MAX_CLIENT_MESSAGES_PER_MINUTE) {
+      if (now - c.rateLimitNoticeAt > 10000) {
+        c.rateLimitNoticeAt = now;
+        this.send(c, ["NOTICE", "rate-limited: too many messages; retry shortly"]);
+      }
+      return;
+    }
     if (byteLength(raw) > DEFAULT_MAX_CLIENT_MESSAGE_BYTES) {
       this.send(c, ["NOTICE", "rate-limited: message is too large"]);
       return;
