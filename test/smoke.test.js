@@ -68,3 +68,20 @@ test("REQ without an available upstream is closed immediately", async () => {
   await hub.onClientMessage("client", JSON.stringify(["REQ", "sub", { kinds: [1] }]));
   assert.deepEqual(sent, [["CLOSED", "sub", "error: no upstream relay available"]]);
 });
+
+test("storage failures back off instead of retrying on every traffic message", async () => {
+  let writes = 0;
+  const state = {
+    storage: {
+      async get() { return undefined; },
+      async put() { writes++; throw new Error("storage unavailable"); }
+    }
+  };
+  const hub = new RelayHub(state, {});
+  hub.loaded = true;
+  hub.lastPersistAt = 0;
+  for (let i = 0; i < 20; i++) hub.recordTraffic("upload", "client", "[\"REQ\"]", ["REQ"]);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(writes, 1);
+  assert.ok(hub.persistRetryAt > Date.now());
+});

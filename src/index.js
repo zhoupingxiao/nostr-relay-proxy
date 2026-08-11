@@ -37,6 +37,7 @@ function relayState(url, extra = {}) {
 // to upstream relays but are not features implemented by this relay itself.
 const DEFAULT_SUPPORTED_NIPS = [1, 11, 42, 45, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
+const DEFAULT_PERSIST_FAILURE_BACKOFF_MS = 60000;
 const DEFAULT_MAX_SECONDARY_RELAYS = 2;
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 20;
@@ -150,13 +151,22 @@ function publicCacheKey(url, name) {
   return new Request(key.toString());
 }
 
+async function durableFetch(env, request) {
+  try {
+    const id = env.RELAY.idFromName("global");
+    return await env.RELAY.get(id).fetch(request);
+  } catch (error) {
+    console.error("Durable Object dispatch failed", error);
+    return json({ error: "relay temporarily unavailable", message: "Durable Object is busy or unavailable; retry shortly" }, 503, { "retry-after": "10" });
+  }
+}
+
 async function cachedRelayResponse(request, env, upstreamPath, cacheName, seconds) {
   const cache = caches.default;
   const key = publicCacheKey(new URL(request.url), cacheName);
   const cached = await cache.match(key);
   if (cached) return cached;
-  const id = env.RELAY.idFromName("global");
-  const upstream = await env.RELAY.get(id).fetch(`https://relay${upstreamPath}`);
+  const upstream = await durableFetch(env, `https://relay${upstreamPath}`);
   const headers = new Headers(upstream.headers);
   headers.set("cache-control", `public, max-age=${seconds}, s-maxage=${seconds}`);
   const response = new Response(upstream.body, { status: upstream.status, headers });
@@ -538,8 +548,7 @@ export default {
       if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
         if (!await allowWebSocketConnection(request, env))
           return new Response("Too many new WebSocket connections; please retry shortly.", { status: 429 });
-        const id = env.RELAY.idFromName("global");
-        return env.RELAY.get(id).fetch(request);
+        return durableFetch(env, request);
       }
       if (request.headers.get("accept")?.includes("application/nostr+json")) {
         return cachedRelayResponse(request, env, "/nip11", "nip11", NIP11_CACHE_SECONDS);
@@ -578,20 +587,17 @@ export default {
       }
       if (url.pathname === "/admin") return adminPage();
 
-      const id = env.RELAY.idFromName("global");
-      const stub = env.RELAY.get(id);
-
       if (request.method === "GET" && url.pathname === "/admin/api/status")
-        return stub.fetch("https://relay/status");
+        return durableFetch(env, "https://relay/status");
 
       if (request.method === "GET" && url.pathname === "/admin/api/relays")
-        return stub.fetch("https://relay/relays");
+        return durableFetch(env, "https://relay/relays");
 
       if (request.method === "GET" && url.pathname === "/admin/api/settings")
-        return stub.fetch("https://relay/settings");
+        return durableFetch(env, "https://relay/settings");
 
       if (request.method === "POST" && url.pathname === "/admin/api/settings") {
-        const response = await stub.fetch(new Request("https://relay/settings", {
+        const response = await durableFetch(env, new Request("https://relay/settings", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
@@ -601,7 +607,7 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/admin/api/relays") {
-        const response = await stub.fetch(new Request("https://relay/relays", {
+        const response = await durableFetch(env, new Request("https://relay/relays", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
@@ -611,7 +617,7 @@ export default {
       }
 
       if (request.method === "DELETE" && url.pathname === "/admin/api/relays") {
-        const response = await stub.fetch(new Request("https://relay/relays", {
+        const response = await durableFetch(env, new Request("https://relay/relays", {
           method: "DELETE",
           headers: { "content-type": "application/json" },
           body: await request.text()
@@ -621,7 +627,7 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/admin/api/relays/toggle") {
-        const response = await stub.fetch(new Request("https://relay/relays/toggle", {
+        const response = await durableFetch(env, new Request("https://relay/relays/toggle", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: await request.text()
@@ -641,8 +647,7 @@ export default {
     }
 
     if (request.headers.get("accept")?.includes("application/nostr+json")) {
-      const id = env.RELAY.idFromName("global");
-      return env.RELAY.get(id).fetch("https://relay/nip11");
+      return durableFetch(env, "https://relay/nip11");
     }
 
     return json({ error: "not found" }, 404);
@@ -662,6 +667,7 @@ export class RelayHub {
       uploadedMessages: 0, downloadedMessages: 0, uploadedBytes: 0, downloadedBytes: 0
     };
     this.lastPersistAt = 0;
+    this.persistRetryAt = 0;
     this.persistInFlight = null;
     this.persistStatsInFlight = null;
     this.persistRelaysInFlight = null;
@@ -711,6 +717,7 @@ export class RelayHub {
     })().finally(() => {
       this.persistInFlight = null;
     });
+    this.persistInFlight.catch(() => { this.persistRetryAt = Date.now() + DEFAULT_PERSIST_FAILURE_BACKOFF_MS; });
     return this.persistInFlight;
   }
 
@@ -719,6 +726,7 @@ export class RelayHub {
     this.persistStatsInFlight = this.state.storage.put("stats", this.stats)
       .then(() => { this.lastPersistAt = Date.now(); })
       .finally(() => { this.persistStatsInFlight = null; });
+    this.persistStatsInFlight.catch(() => { this.persistRetryAt = Date.now() + DEFAULT_PERSIST_FAILURE_BACKOFF_MS; });
     return this.persistStatsInFlight;
   }
 
@@ -729,6 +737,7 @@ export class RelayHub {
       await this.state.storage.put("relays", this.relays);
       this.lastPersistAt = Date.now();
     })().finally(() => { this.persistStatsInFlight = null; });
+    this.persistStatsInFlight.catch(() => { this.persistRetryAt = Date.now() + DEFAULT_PERSIST_FAILURE_BACKOFF_MS; });
     return this.persistStatsInFlight;
   }
 
@@ -736,6 +745,7 @@ export class RelayHub {
     if (this.persistRelaysInFlight) return this.persistRelaysInFlight;
     this.persistRelaysInFlight = this.state.storage.put("relays", this.relays)
       .finally(() => { this.persistRelaysInFlight = null; });
+    this.persistRelaysInFlight.catch(() => { this.persistRetryAt = Date.now() + DEFAULT_PERSIST_FAILURE_BACKOFF_MS; });
     return this.persistRelaysInFlight;
   }
 
@@ -777,7 +787,8 @@ export class RelayHub {
         if (entry.type === "EVENT") relay.downloadedEvents = (relay.downloadedEvents || 0) + 1;
       }
     }
-    if (Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
+    const now = Date.now();
+    if (now >= this.persistRetryAt && now - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
   }
 
   ensureRuntimeSettings() {
@@ -1059,7 +1070,8 @@ export class RelayHub {
           }
         } catch {}
       }
-      if (ok && Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
+      const now = Date.now();
+      if (ok && now >= this.persistRetryAt && now - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persistTraffic().catch(() => {});
       this.send(c, ["OK", event.id, ok, ok ? "forwarded" : "no upstream relay available"]);
       return;
     }
