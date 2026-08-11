@@ -533,6 +533,7 @@ export class RelayHub {
       uploadedMessages: 0, downloadedMessages: 0, uploadedBytes: 0, downloadedBytes: 0
     };
     this.lastPersistAt = 0;
+    this.persistInFlight = null;
     this.loaded = false;
   }
 
@@ -554,11 +555,17 @@ export class RelayHub {
     for (const r of this.relays.filter(x => x.enabled)) this.connectUpstream(r.url);
   }
 
-  async persist() {
-    await this.state.storage.put("relays", this.relays);
-    await this.state.storage.put("settings", this.settings);
-    await this.state.storage.put("stats", this.stats);
-    this.lastPersistAt = Date.now();
+  persist() {
+    if (this.persistInFlight) return this.persistInFlight;
+    this.persistInFlight = (async () => {
+      await this.state.storage.put("relays", this.relays);
+      await this.state.storage.put("settings", this.settings);
+      await this.state.storage.put("stats", this.stats);
+      this.lastPersistAt = Date.now();
+    })().finally(() => {
+      this.persistInFlight = null;
+    });
+    return this.persistInFlight;
   }
 
   recordTraffic(direction, source, raw, msg) {
@@ -579,11 +586,30 @@ export class RelayHub {
     if (Date.now() - this.lastPersistAt > DEFAULT_PERSIST_INTERVAL_MS) this.persist().catch(() => {});
   }
 
+  ensureRuntimeSettings() {
+    if (!this.settings || !["all", "whitelist", "blacklist"].includes(this.settings.accessMode) || !Array.isArray(this.settings.accessPubkeys))
+      this.settings = normalizeSettings(this.settings, this.env);
+  }
+
+  ensureClientState(client) {
+    if (!(client.authenticatedPubkeys instanceof Set)) client.authenticatedPubkeys = new Set();
+    if (!client.authChallenge) client.authChallenge = crypto.randomUUID();
+    if (!client.relayHost) client.relayHost = "";
+    if (typeof client.authChallengeSent !== "boolean") client.authChallengeSent = false;
+    return client;
+  }
+
   clientStatistics() {
+    this.ensureRuntimeSettings();
     const authenticatedPubkeys = new Set();
     const activePubkeys = new Set();
     let authorizedConnections = 0;
     for (const client of this.clients.values()) {
+      this.ensureClientState(client);
+      if (this.settings.accessMode !== "all" && !client.authenticatedPubkeys.size && !client.authChallengeSent) {
+        this.send(client, ["AUTH", client.authChallenge]);
+        client.authChallengeSent = true;
+      }
       for (const pubkey of client.authenticatedPubkeys) authenticatedPubkeys.add(pubkey);
       if (!this.clientAccess(client).allowed) continue;
       authorizedConnections++;
@@ -602,12 +628,14 @@ export class RelayHub {
     try {
       return await this.handleFetch(request);
     } catch (error) {
+      console.error("RelayHub request failed", error);
       return json({ error: "durable object error", message: errorMessage(error) }, 500);
     }
   }
 
   async handleFetch(request) {
     await this.load();
+    this.ensureRuntimeSettings();
     const url = new URL(request.url);
     const clientStats = this.clientStatistics();
     const clientSubscriptions = [...this.clients.values()].reduce((n, c) => n + c.subscriptions.size, 0);
@@ -664,7 +692,11 @@ export class RelayHub {
       await this.persist();
       if (this.settings.accessMode !== "all") {
         for (const client of this.clients.values()) {
-          if (!client.authenticatedPubkeys.size) this.send(client, ["AUTH", client.authChallenge]);
+          this.ensureClientState(client);
+          if (!client.authenticatedPubkeys.size) {
+            this.send(client, ["AUTH", client.authChallenge]);
+            client.authChallengeSent = true;
+          }
         }
       }
       return json(this.settings);
@@ -734,6 +766,7 @@ export class RelayHub {
       seen: new Map(),
       authenticatedPubkeys: new Set(),
       authChallenge: crypto.randomUUID(),
+      authChallengeSent: false,
       relayHost: relayHost(request.url),
       createdAt: Date.now()
     };
@@ -746,8 +779,10 @@ export class RelayHub {
     server.addEventListener("close", () => this.closeClient(clientId));
     server.addEventListener("error", () => this.closeClient(clientId));
 
-    if (this.settings.accessMode !== "all")
+    if (this.settings.accessMode !== "all") {
       this.send(state, ["AUTH", state.authChallenge]);
+      state.authChallengeSent = true;
+    }
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -755,6 +790,7 @@ export class RelayHub {
   async onClientMessage(clientId, raw) {
     const c = this.clients.get(clientId);
     if (!c || typeof raw !== "string") return;
+    this.ensureClientState(c);
     let msg;
     try { msg = JSON.parse(raw); } catch {
       try { c.ws.send(JSON.stringify(["NOTICE", "invalid JSON"])); } catch {}
@@ -888,6 +924,7 @@ export class RelayHub {
   }
 
   authenticateClient(c, event) {
+    this.ensureClientState(c);
     const eventId = typeof event?.id === "string" ? event.id : "";
     const fail = reason => this.send(c, ["OK", eventId, false, reason]);
     if (!event || event.kind !== 22242 || !/^[0-9a-f]{64}$/i.test(event.pubkey || ""))
@@ -904,6 +941,8 @@ export class RelayHub {
   }
 
   clientAccess(c) {
+    this.ensureRuntimeSettings();
+    this.ensureClientState(c);
     const mode = this.settings.accessMode;
     if (mode === "all") return { allowed: true };
     if (!c.authenticatedPubkeys.size)
