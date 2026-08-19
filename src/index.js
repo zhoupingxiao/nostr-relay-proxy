@@ -727,6 +727,35 @@ export class RelayHub {
     this.loaded = false;
   }
 
+  hasClients() {
+    return this.clients.size > 0;
+  }
+
+  startUpstreams() {
+    if (!this.loaded || !this.hasClients()) return;
+    const now = Date.now();
+    this.relays.filter(x => x.enabled).forEach((relay, index) => {
+      if (Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt > now) return;
+      const delay = Math.min(index * DEFAULT_UPSTREAM_START_STAGGER_MS, 30000) + Math.round(Math.random() * 250);
+      this.queueConnect(relay.url, delay);
+    });
+    this.scheduleAlarm();
+  }
+
+  clearAlarm() {
+    this.alarmAt = null;
+    if (typeof this.state.storage.deleteAlarm === "function")
+      Promise.resolve(this.state.storage.deleteAlarm()).catch(() => {});
+  }
+
+  stopIdleUpstreams() {
+    if (this.hasClients()) return;
+    for (const relay of this.relays) this.cancelReconnect(relay.url);
+    for (const url of [...this.upstreams.keys()]) this.stopUpstream(url, "idle");
+    this.persistRelays().catch(() => {});
+    this.clearAlarm();
+  }
+
   async load() {
     if (this.loaded) return;
     const storedRelays = await this.state.storage.get("relays");
@@ -746,13 +775,7 @@ export class RelayHub {
       await this.state.storage.put("stats", this.stats);
     }
     this.loaded = true;
-    const now = Date.now();
-    this.relays.filter(x => x.enabled).forEach((relay, index) => {
-      if (Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt > now) return;
-      const delay = Math.min(index * DEFAULT_UPSTREAM_START_STAGGER_MS, 30000) + Math.round(Math.random() * 250);
-      this.queueConnect(relay.url, delay);
-    });
-    this.scheduleAlarm();
+    this.startUpstreams();
   }
 
   persist() {
@@ -801,7 +824,10 @@ export class RelayHub {
     const next = this.relays
       .filter(relay => relay.enabled && Number.isFinite(relay.nextReconnectAt))
       .reduce((time, relay) => Math.min(time, relay.nextReconnectAt), Number.POSITIVE_INFINITY);
-    if (!Number.isFinite(next) || !this.state.storage.setAlarm) return;
+    if (!Number.isFinite(next) || !this.state.storage.setAlarm) {
+      if (!Number.isFinite(next)) this.clearAlarm();
+      return;
+    }
     if (this.alarmAt && this.alarmAt <= next) return;
     this.alarmAt = next;
     Promise.resolve().then(() => this.state.storage.setAlarm(next)).catch(() => { this.alarmAt = null; });
@@ -810,6 +836,10 @@ export class RelayHub {
   async alarm() {
     this.alarmAt = null;
     await this.load();
+    if (!this.hasClients()) {
+      this.stopIdleUpstreams();
+      return;
+    }
     const now = Date.now();
     for (const relay of this.relays) {
       if (relay.enabled && Number.isFinite(relay.nextReconnectAt) && relay.nextReconnectAt <= now) {
@@ -1052,6 +1082,7 @@ export class RelayHub {
     };
     this.clients.set(clientId, state);
     this.stats.connections++;
+    this.startUpstreams();
 
     server.accept();
     server.serializeAttachment({ clientId });
@@ -1381,6 +1412,7 @@ export class RelayHub {
       if (u) u.negRoutes.delete(route.upstreamId);
     }
     this.clients.delete(clientId);
+    this.stopIdleUpstreams();
   }
 
   finishCount(clientId, subId, approximate = false) {

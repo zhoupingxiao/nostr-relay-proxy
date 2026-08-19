@@ -60,6 +60,18 @@ test("RelayHub persists settings and normalizes access users", async () => {
   assert.ok(state.writes.includes("settings"));
 });
 
+test("idle RelayHub does not start upstream connections", async () => {
+  const state = mockState({ relays: [{ url: "wss://relay.example" }] });
+  const hub = new RelayHub(state, {});
+  let queued = 0;
+  hub.queueConnect = () => { queued++; };
+  await hub.load();
+  assert.equal(queued, 0);
+  hub.clients.set("client", { subscriptions: new Map() });
+  hub.startUpstreams();
+  assert.equal(queued, 1);
+});
+
 test("REQ without an available upstream is closed immediately", async () => {
   const state = mockState();
   const hub = new RelayHub(state, {});
