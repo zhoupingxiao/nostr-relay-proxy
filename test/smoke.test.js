@@ -121,23 +121,34 @@ test("private-message subscriptions query every open upstream while normal feeds
   const state = mockState({ relays: urls.map(url => ({ url })) });
   const hub = new RelayHub(state, {});
   await hub.load();
+  hub.settings.accessMode = "whitelist";
+  hub.settings.accessPubkeys = [];
+  hub.settings.accessUsers = [];
+  hub.accessSettingsRef = null;
   const upstreams = urls.map(url => ({
     url,
     ws: { readyState: 1, send(value) { this.messages.push(JSON.parse(value)); }, messages: [] },
     routes: new Map(), countRoutes: new Map(), negRoutes: new Map()
   }));
   hub.openUpstreams = () => upstreams;
+  const sent = [];
   hub.clients.set("client", {
     id: "client",
-    ws: { send() {} },
+    ws: { send(value) { sent.push(JSON.parse(value)); } },
     subscriptions: new Map(), counts: new Map(), negentropy: new Map(), seen: new Map(),
     authenticatedPubkeys: new Set(), authChallenge: "challenge", authChallengeSent: false,
     relayHost: "relay.example", createdAt: Date.now()
   });
   await hub.onClientMessage("client", JSON.stringify(["REQ", "dm", { kinds: [4], "#p": ["a".repeat(64)] }]));
   assert.equal(upstreams.filter(upstream => upstream.ws.messages.length).length, 3);
+  await hub.onClientMessage("client", JSON.stringify(["EVENT", { id: "b".repeat(64), kind: 4, pubkey: "c".repeat(64), created_at: 1, tags: [], content: "encrypted" }]));
+  assert.deepEqual(sent.at(-1), ["OK", "b".repeat(64), true, "forwarded"]);
   for (const upstream of upstreams) upstream.ws.messages = [];
   hub.clients.get("client").subscriptions.clear();
+  await hub.onClientMessage("client", JSON.stringify(["REQ", "blocked", { kinds: [1] }]));
+  assert.deepEqual(sent.at(-1), ["CLOSED", "blocked", "auth-required: authenticate with NIP-42 to use this relay"]);
+  hub.settings.accessMode = "all";
+  hub.accessSettingsRef = null;
   await hub.onClientMessage("client", JSON.stringify(["REQ", "feed", { kinds: [1] }]));
   assert.equal(upstreams.filter(upstream => upstream.ws.messages.length).length, 2);
 });
