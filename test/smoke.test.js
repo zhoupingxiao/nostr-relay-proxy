@@ -86,6 +86,20 @@ test("RelayHub persists the administrator's upstream relay order", async () => {
   assert.ok(state.writes.includes("relays"));
 });
 
+test("adding an existing relay returns a duplicate marker", async () => {
+  const state = mockState({ relays: [{ url: "wss://relay.example" }] });
+  const hub = new RelayHub(state, {});
+  await hub.load();
+  const response = await hub.fetch(new Request("https://relay/relays", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "relay.example" })
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-relay-existing"), "1");
+  assert.equal((await response.json()).length, 1);
+});
+
 test("REQ without an available upstream is closed immediately", async () => {
   const state = mockState();
   const hub = new RelayHub(state, {});
