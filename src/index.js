@@ -32,13 +32,16 @@ function relayState(url, extra = {}) {
   };
 }
 
-// Only advertise relay-side protocol features implemented by this proxy.
-// Event-format NIPs (such as 2, 4, 9, 28 and 40) are transparently forwarded
-// to upstream relays but are not features implemented by this relay itself.
-const DEFAULT_SUPPORTED_NIPS = [1, 11, 42, 45, 77];
+// Advertise the relay protocol features implemented by this proxy.  Encrypted
+// private-message NIPs are transported without decryption or modification.
+const DEFAULT_SUPPORTED_NIPS = [1, 4, 11, 17, 42, 45, 59, 77];
 const DEFAULT_PERSIST_INTERVAL_MS = 30000;
 const DEFAULT_PERSIST_FAILURE_BACKOFF_MS = 60000;
 const DEFAULT_MAX_SECONDARY_RELAYS = 2;
+// Private messages are encrypted events.  The proxy never decrypts or
+// transforms them; it fans out private-message subscriptions to every open
+// upstream and relies on the per-subscription event-id cache for de-duplication.
+const PRIVATE_MESSAGE_KINDS = new Set([4, 13, 14, 1059]);
 const DEFAULT_MAX_CLIENT_SUBSCRIPTIONS = 24;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIPTION = 20;
 const DEFAULT_MAX_SUBSCRIPTION_BYTES = 48 * 1024;
@@ -466,7 +469,7 @@ const UI_TRANSLATIONS = {
     controlCenter: "Control center", relayConsole: "Relay 网络控制台", adminDescription: "上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。",
     enableHint: "启用后立即连接；停用不会删除配置。", address: "地址", status: "状态", latency: "延迟", connectionDuration: "连接时长", forwarded: "转发", download: "下载", upload: "上传", downloadSize: "下载量", reconnects: "重连", lastError: "最后错误", actions: "操作",
     relayAddress: "relay.example.com", addRelay: "添加 Relay", connectionInfo: "连接信息", clientAddressHint: "将以下地址填入 Nostr 客户端。", copyWebsocket: "复制 WebSocket 地址", serviceRuntime: "服务运行时间",
-    relayProfile: "中继资料", relayName: "中继名称", description: "描述", ownerPubkey: "机主公钥 hex", contact: "联系方式，例如 mailto:you@example.com", iconUrl: "头像 URL", supportedNips: "支持的 NIPs（由程序自动声明）：01、11、42、45、77",
+    relayProfile: "中继资料", relayName: "中继名称", description: "描述", ownerPubkey: "机主公钥 hex", contact: "联系方式，例如 mailto:you@example.com", iconUrl: "头像 URL", supportedNips: "支持的 NIPs（由程序自动声明）：01、04、11、17、42、45、59、77",
     priorityRelay: "优先中继", priorityDescription: "读取始终经过它，再选延迟最低的两个；发布会优先发送给它并继续发送到其他在线上游。", noPriority: "不设置（仅按延迟）", refreshInterval: "上游列表刷新间隔（秒，最低 60）", saveSettings: "保存资料和运行设置",
     accessControl: "访问控制", accessDescription: "白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行一条，格式为：公钥 | 用户名（用户名可选）。", all: "全部", whitelist: "白名单", blacklist: "黑名单", userPubkey: "公钥（npub 或 hex）", userName: "用户名", addUser: "新增用户", remove: "删除",
     currentUsers: "当前有效用户", loadingUsers: "加载中…", allUsersHint: "全部模式按在线连接计数；客户端未认证时无法识别其公钥。", currentUsersHint: "当前 {n} 个已认证且通过规则的用户；已认证公钥总数 {total}。", noUsers: "暂无有效用户", copy: "复制",
@@ -485,7 +488,7 @@ const UI_TRANSLATIONS = {
     controlCenter: "Control center", relayConsole: "Relay network console", adminDescription: "The upstream Relay list refreshes at the configured interval; other data updates when the page opens or settings are saved.",
     enableHint: "Enabled Relays connect immediately; disabling keeps the configuration.", address: "Address", status: "Status", latency: "Latency", connectionDuration: "Connected for", forwarded: "Forwarded", download: "Downloaded", upload: "Uploaded", downloadSize: "Download size", reconnects: "Reconnects", lastError: "Last error", actions: "Actions",
     relayAddress: "relay.example.com", addRelay: "Add Relay", connectionInfo: "Connection info", clientAddressHint: "Use this address in your Nostr client.", copyWebsocket: "Copy WebSocket URL", serviceRuntime: "Service uptime",
-    relayProfile: "Relay profile", relayName: "Relay name", description: "Description", ownerPubkey: "Owner pubkey hex", contact: "Contact, e.g. mailto:you@example.com", iconUrl: "Icon URL", supportedNips: "Supported NIPs (declared automatically): 01, 11, 42, 45, 77",
+    relayProfile: "Relay profile", relayName: "Relay name", description: "Description", ownerPubkey: "Owner pubkey hex", contact: "Contact, e.g. mailto:you@example.com", iconUrl: "Icon URL", supportedNips: "Supported NIPs (declared automatically): 01, 04, 11, 17, 42, 45, 59, 77",
     priorityRelay: "Priority Relay", priorityDescription: "Reads always include it, then the two lowest-latency Relays; publishes go to it and all other online upstreams.", noPriority: "Not set (latency only)", refreshInterval: "Upstream refresh interval (seconds, minimum 60)", saveSettings: "Save relay and runtime settings",
     accessControl: "Access control", accessDescription: "Whitelist and blacklist modes require NIP-42 authentication; one entry per row: pubkey | username (username is optional).", all: "All", whitelist: "Whitelist", blacklist: "Blacklist", userPubkey: "Pubkey (npub or hex)", userName: "Username", addUser: "Add user", remove: "Remove",
     currentUsers: "Current effective users", loadingUsers: "Loading…", allUsersHint: "All mode counts connected clients; unauthenticated clients cannot be identified by pubkey.", currentUsersHint: "{n} authenticated users currently pass the rule; {total} authenticated pubkey(s) in total.", noUsers: "No effective users", copy: "Copy",
@@ -501,7 +504,7 @@ const UI_STATIC_KEYS = {
   "欢迎回来": "welcome", "登录后管理上游 Relay 与实时网络状态。": "loginDescription", "安全登录": "safeLogin", "Relay 网络控制台": "relayConsole",
   "打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。": "adminDescription", "上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。": "adminDescription",
   "启用后立即连接；停用不会删除配置。": "enableHint", "地址": "address", "状态": "status", "延迟": "latency", "连接时长": "connectionDuration", "转发": "forwarded", "下载": "download", "上传": "upload", "下载量": "downloadSize", "重连": "reconnects", "最后错误": "lastError", "操作": "actions",
-  "添加 Relay": "addRelay", "连接信息": "connectionInfo", "将以下地址填入 Nostr 客户端。": "clientAddressHint", "复制 WebSocket 地址": "copyWebsocket", "服务运行时间": "serviceRuntime", "中继资料": "relayProfile", "描述": "description", "支持的 NIPs（由程序自动声明）：01、11、42、45、77": "supportedNips", "优先中继": "priorityRelay",
+  "添加 Relay": "addRelay", "连接信息": "connectionInfo", "将以下地址填入 Nostr 客户端。": "clientAddressHint", "复制 WebSocket 地址": "copyWebsocket", "服务运行时间": "serviceRuntime", "中继资料": "relayProfile", "描述": "description", "支持的 NIPs（由程序自动声明）：01、04、11、17、42、45、59、77": "supportedNips", "优先中继": "priorityRelay",
   "访问控制": "accessControl", "当前有效用户": "currentUsers", "新增用户": "addUser", "全部": "all", "白名单": "whitelist", "黑名单": "blacklist", "全部模式按在线连接计数；客户端未认证时无法识别其公钥。": "allUsersHint", "暂无有效用户": "noUsers", "保存资料和运行设置": "saveSettings", "上游列表刷新间隔（秒，最低 60）": "refreshInterval",
   "在线用户": "onlineUsers", "有效用户": "effectiveUsers", "客户端活跃订阅": "clientSubscriptions", "上游活跃订阅": "upstreamSubscriptions", "可用 Relay": "availableRelays", "服务运行": "serviceUptime", "已认证用户": "authenticatedUsers", "在线连接": "onlineConnections", "可用上游": "availableUpstream", "上传流量": "uploadedTraffic", "下载流量": "downloadedTraffic", "客户端事件": "clientEvents", "拖动排序": "dragHandle", "点击按延迟排序": "sortLatency", "在线": "online", "离线": "offline", "已停用": "disabled", "启用": "enable", "停用": "disable", "复制": "copy", "已复制": "copied", "删除": "delete", "请求失败": "requestFailed", "保存失败": "saveFailed", "未授权": "unauthorized", "用户名或密码错误": "invalidLogin", "当前 Worker 未读取到 ADMIN_USER 或 ADMIN_PASSWORD，请在 Variables and Secrets 保存并部署到当前环境。": "missingCredentials", "已保存中继资料、优先中继、刷新间隔和访问控制": "savedSettings", "正在保存…": "saving", "—": "noValue", "不设置（仅按延迟）": "noPriority", "提示：上游列表、中继资料和优先中继都保存在 Durable Object；Cloudflare 中的变量仅用于首次默认值。": "hintStorage", "白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行一条，格式为：公钥 | 用户名（用户名可选）。": "accessDescription", "读取始终经过它，再选延迟最低的两个；发布会优先发送给它并继续发送到其他在线上游。": "priorityDescription", "（已停用）": "disabledRelay"
 };
@@ -538,7 +541,7 @@ function renderAdminHtml() {
   return ADMIN_HTML
     .replace("const elapsed=n=>{if(!n)return '—';let s=Math.floor((Date.now()-n)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'小时 '+m+'分';if(m)return m+'分 '+(s%60)+'秒';return s+'秒'}", "const elapsed=n=>{if(!n)return '—';let seconds=Math.max(0,Math.floor((Date.now()-n)/1000));const days=Math.floor(seconds/86400);seconds%=86400;const hours=Math.floor(seconds/3600);seconds%=3600;const minutes=Math.floor(seconds/60);const english=window.currentLocale?.()==='en';const units=english?['d','h','m','s']:['天','小时','分钟','秒'];const parts=[];if(days)parts.push(days+units[0]);if(hours)parts.push(hours+units[1]);if(minutes)parts.push(minutes+units[2]);if(!parts.length)parts.push((seconds%60)+units[3]);return parts.join(' ')}")
     .replace('打开页面时读取一次连接、流量与上游健康状态；需要最新数据时请手动刷新浏览器页面。', '上游 Relay 列表会按设定间隔刷新；其余资料在打开页面或保存设置时更新。')
-    .replace('支持的 NIPs（由程序自动声明）：01、11、45、77', '支持的 NIPs（由程序自动声明）：01、11、42、45、77')
+    .replace('支持的 NIPs（由程序自动声明）：01、11、45、77', '支持的 NIPs（由程序自动声明）：01、04、11、17、42、45、59、77')
     .replace('<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><button class="button primary" id="save-settings">保存资料和优先中继</button>', '<select class="input" id="set-priority-relay"><option value="">不设置（仅按延迟）</option></select><label class="muted" for="set-status-refresh">上游列表刷新间隔（秒，最低 60）</label><input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>')
     .replace('<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><button class="button primary" id="save-settings">保存资料和运行设置</button>', '<input class="input" id="set-status-refresh" type="number" min="60" max="900" step="30" value="60"><hr style="border:0;border-top:1px solid #28445f;margin:8px 0 2px;width:100%"><h2>访问控制</h2><p class="muted" style="margin:0">白名单和黑名单会要求客户端完成 NIP-42 身份认证；每行填入一个用户公钥（hex 或 npub）。</p><select class="input" id="set-access-mode"><option value="all">全部</option><option value="whitelist">白名单</option><option value="blacklist">黑名单</option></select><textarea class="input" id="set-access-pubkeys" rows="8" wrap="off" style="min-width:0;white-space:pre;overflow-x:auto" placeholder="npub1… 或 64 位 hex 公钥，每行一个"></textarea><button class="button primary" id="save-settings">保存资料和运行设置</button>')
     .replace('每行填入一个用户公钥（hex 或 npub）。', '每行一条，格式为：公钥 | 用户名（用户名可选）。')
@@ -1241,7 +1244,7 @@ export class RelayHub {
       // closing its previous upstream routes, clients that refresh filters
       // quickly leak subscriptions until an upstream starts rate-limiting.
       this.closeSubscription(c, subId);
-      const upstreams = this.preferredUpstreams();
+      const upstreams = this.subscriptionUpstreams(filters);
       if (!upstreams.length) return this.send(c, ["CLOSED", subId, "error: no upstream relay available"]);
       const sub = { filters, upstreamIds: new Map(), eoseUrls: new Set(), eoseSent: false, eoseTimer: null };
       c.subscriptions.set(subId, sub);
@@ -1374,6 +1377,19 @@ export class RelayHub {
     return priority ? [priority, ...secondary] : secondary;
   }
 
+  isPrivateMessageSubscription(filters) {
+    return Array.isArray(filters) && filters.length > 0 && filters.every(filter => {
+      const kinds = Array.isArray(filter?.kinds) ? filter.kinds : [];
+      return kinds.length > 0 && kinds.every(kind => PRIVATE_MESSAGE_KINDS.has(Number(kind)));
+    });
+  }
+
+  subscriptionUpstreams(filters) {
+    return this.isPrivateMessageSubscription(filters)
+      ? this.openUpstreams()
+      : this.preferredUpstreams();
+  }
+
   writeUpstreams() {
     const priority = this.settings.priorityRelay;
     return this.openUpstreams().sort((left, right) => {
@@ -1383,7 +1399,8 @@ export class RelayHub {
     });
   }
 
-  maxSubscriptionRelayCount() {
+  maxSubscriptionRelayCount(filters = []) {
+    if (this.isPrivateMessageSubscription(filters)) return Math.max(1, this.openUpstreams().length);
     return this.settings.priorityRelay ? DEFAULT_MAX_SECONDARY_RELAYS + 1 : DEFAULT_MAX_SECONDARY_RELAYS;
   }
 
@@ -1396,7 +1413,7 @@ export class RelayHub {
 
   routeSubscription(c, subId, u) {
     const sub = c.subscriptions.get(subId);
-    if (!sub || sub.upstreamIds.has(u.url) || sub.upstreamIds.size >= this.maxSubscriptionRelayCount()) return;
+    if (!sub || sub.upstreamIds.has(u.url) || sub.upstreamIds.size >= this.maxSubscriptionRelayCount(sub.filters)) return;
     const upstreamId = `${c.id}:${subId}:${crypto.randomUUID().slice(0, 8)}`;
     sub.upstreamIds.set(u.url, upstreamId);
     u.routes.set(upstreamId, { clientId: c.id, subId });
@@ -1546,7 +1563,8 @@ export class RelayHub {
     }
     this.upstreams.delete(url);
     for (const [c, subId] of affectedSubscriptions) {
-      for (const candidate of this.preferredUpstreams()) this.routeSubscription(c, subId, candidate);
+      const sub = c.subscriptions.get(subId);
+      for (const candidate of this.subscriptionUpstreams(sub?.filters || [])) this.routeSubscription(c, subId, candidate);
     }
     const reconnecting = !u.manualClose && item?.enabled;
     if (reconnecting) {
@@ -1615,8 +1633,8 @@ export class RelayHub {
       for (const c of this.clients.values()) {
         this.ensureClientState(c);
         for (const [subId, sub] of c.subscriptions) {
-          if (sub.upstreamIds.size >= this.maxSubscriptionRelayCount()) continue;
-          if (this.preferredUpstreams().some(candidate => candidate.url === url))
+          if (sub.upstreamIds.size >= this.maxSubscriptionRelayCount(sub.filters)) continue;
+          if (this.subscriptionUpstreams(sub.filters).some(candidate => candidate.url === url))
             this.routeSubscription(c, subId, u);
         }
       }

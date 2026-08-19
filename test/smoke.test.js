@@ -116,6 +116,32 @@ test("REQ without an available upstream is closed immediately", async () => {
   assert.deepEqual(sent, [["CLOSED", "sub", "error: no upstream relay available"]]);
 });
 
+test("private-message subscriptions query every open upstream while normal feeds stay limited", async () => {
+  const urls = ["wss://one.example", "wss://two.example", "wss://three.example"];
+  const state = mockState({ relays: urls.map(url => ({ url })) });
+  const hub = new RelayHub(state, {});
+  await hub.load();
+  const upstreams = urls.map(url => ({
+    url,
+    ws: { readyState: 1, send(value) { this.messages.push(JSON.parse(value)); }, messages: [] },
+    routes: new Map(), countRoutes: new Map(), negRoutes: new Map()
+  }));
+  hub.openUpstreams = () => upstreams;
+  hub.clients.set("client", {
+    id: "client",
+    ws: { send() {} },
+    subscriptions: new Map(), counts: new Map(), negentropy: new Map(), seen: new Map(),
+    authenticatedPubkeys: new Set(), authChallenge: "challenge", authChallengeSent: false,
+    relayHost: "relay.example", createdAt: Date.now()
+  });
+  await hub.onClientMessage("client", JSON.stringify(["REQ", "dm", { kinds: [4], "#p": ["a".repeat(64)] }]));
+  assert.equal(upstreams.filter(upstream => upstream.ws.messages.length).length, 3);
+  for (const upstream of upstreams) upstream.ws.messages = [];
+  hub.clients.get("client").subscriptions.clear();
+  await hub.onClientMessage("client", JSON.stringify(["REQ", "feed", { kinds: [1] }]));
+  assert.equal(upstreams.filter(upstream => upstream.ws.messages.length).length, 2);
+});
+
 test("storage failures back off instead of retrying on every traffic message", async () => {
   let writes = 0;
   const state = {
@@ -145,7 +171,7 @@ test("NIP-11 remains available when Durable Object dispatch fails", async () => 
   }), env);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("x-relay-degraded"), "1");
-  assert.deepEqual((await response.json()).supported_nips, [1, 11, 42, 45, 77]);
+  assert.deepEqual((await response.json()).supported_nips, [1, 4, 11, 17, 42, 45, 59, 77]);
 });
 
 test("public status returns a degraded snapshot when Durable Object is down", async () => {
