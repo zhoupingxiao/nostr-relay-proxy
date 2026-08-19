@@ -72,6 +72,20 @@ test("idle RelayHub does not start upstream connections", async () => {
   assert.equal(queued, 1);
 });
 
+test("RelayHub persists the administrator's upstream relay order", async () => {
+  const state = mockState({ relays: [{ url: "wss://one.example" }, { url: "wss://two.example" }] });
+  const hub = new RelayHub(state, {});
+  await hub.load();
+  const response = await hub.fetch(new Request("https://relay/relays/reorder", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ urls: ["wss://two.example", "wss://one.example"] })
+  }));
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).map(relay => relay.url), ["wss://two.example", "wss://one.example"]);
+  assert.ok(state.writes.includes("relays"));
+});
+
 test("REQ without an available upstream is closed immediately", async () => {
   const state = mockState();
   const hub = new RelayHub(state, {});
